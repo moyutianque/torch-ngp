@@ -412,9 +412,9 @@ class NeRFGUI:
             if app_data in {87, 65, 83, 68, 73, 74, 75, 76, 69, 81}:
                 # move
                 if app_data == 87: # w
-                    self.cam.pan(0, -100)
-                elif app_data == 83: # s
                     self.cam.pan(0, 100)
+                elif app_data == 83: # s
+                    self.cam.pan(0, -100)
                 elif app_data==65: # a
                     self.cam.pan(100, 0)
                 elif app_data==68: # d
