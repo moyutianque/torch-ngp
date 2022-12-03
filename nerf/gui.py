@@ -62,9 +62,17 @@ class NeRFGUI:
         self.bg_color = torch.ones(3, dtype=torch.float32) # default white bg
         self.training = False
         self.step = 0 # training step 
+        self.global_iter = 0
 
         self.trainer = trainer
         self.train_loader = train_loader
+        
+        self.val_data = [
+            train_loader._data.poses_verify, 
+            train_loader._data.images_verify,
+            train_loader._data.images_sem_verify,
+        ]
+
         if train_loader is not None:
             self.trainer.error_map = train_loader._data.error_map
 
@@ -91,17 +99,21 @@ class NeRFGUI:
         starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         starter.record()
 
-        outputs = self.trainer.train_gui(self.train_loader, step=self.train_steps)
+        outputs = self.trainer.train_gui(self.train_loader, step=self.train_steps, val_data=self.val_data, iters=self.global_iter)
 
         ender.record()
         torch.cuda.synchronize()
         t = starter.elapsed_time(ender)
 
         self.step += self.train_steps
+        self.global_iter += 1
         self.need_update = True
 
         dpg.set_value("_log_train_time", f'{t:.4f}ms ({int(1000/t)} FPS)')
-        dpg.set_value("_log_train_log", f'step = {self.step: 5d} (+{self.train_steps: 2d}), loss = {outputs["loss"]:.4f}, lr = {outputs["lr"]:.5f}')
+        if "loss_sem" in outputs.keys():
+            dpg.set_value("_log_train_log", f'step = {self.step: 5d} (+{self.train_steps: 2d}), lrgb = {outputs["loss"]:.4f}, lsem = {outputs["loss_sem"]:.4f}, lr = {outputs["lr"]:.5f}')
+        else:
+            dpg.set_value("_log_train_log", f'step = {self.step: 5d} (+{self.train_steps: 2d}), loss = {outputs["loss"]:.4f}, lr = {outputs["lr"]:.5f}')
 
         # dynamic train steps
         # max allowed train time per-frame is 500 ms
@@ -385,6 +397,7 @@ class NeRFGUI:
 
             dx = app_data[1]
             dy = app_data[2]
+            print(dx, dy)
 
             self.cam.pan(dx, dy)
             self.need_update = True
@@ -392,12 +405,42 @@ class NeRFGUI:
             if self.debug:
                 dpg.set_value("_log_pose", str(self.cam.pose))
 
+        def callback_camera_move(sender, app_data):
+            """ wasd (87,65,83,68) move and ijkl(73,74,75,76) rotate, er (69,81) for zoom in/out"""
+            if not dpg.is_item_focused("_primary_window"):
+                return
+            if app_data in {87, 65, 83, 68, 73, 74, 75, 76, 69, 81}:
+                # move
+                if app_data == 87: # w
+                    self.cam.pan(0, -100)
+                elif app_data == 83: # s
+                    self.cam.pan(0, 100)
+                elif app_data==65: # a
+                    self.cam.pan(100, 0)
+                elif app_data==68: # d
+                    self.cam.pan(-100, 0)
+                # rotate
+                elif app_data == 73: # i
+                    self.cam.orbit(0, -20)
+                elif app_data == 75: # k
+                    self.cam.orbit(0, 20)
+                elif app_data==74: # j
+                    self.cam.orbit(-20, 0)
+                elif app_data==76: # l
+                    self.cam.orbit(20, 0)
+                elif app_data == 69: # e
+                    self.cam.scale(1)
+                else: # r
+                    self.cam.scale(-1)
+                self.need_update = True
+
 
         with dpg.handler_registry():
             dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left, callback=callback_camera_drag_rotate)
             dpg.add_mouse_wheel_handler(callback=callback_camera_wheel_scale)
             dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Middle, callback=callback_camera_drag_pan)
-
+            
+            dpg.add_key_press_handler(callback=callback_camera_move)
         
         dpg.create_viewport(title='torch-ngp', width=self.W, height=self.H, resizable=False)
         
@@ -426,11 +469,14 @@ class NeRFGUI:
         dpg.show_viewport()
 
 
-    def render(self):
-
+    def render(self): 
         while dpg.is_dearpygui_running():
             # update texture every frame
             if self.training:
                 self.train_step()
+                if self.step > self.opt.iters:
+                    self.test_step()
+                    dpg.render_dearpygui_frame()
+                    break
             self.test_step()
             dpg.render_dearpygui_frame()

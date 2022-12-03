@@ -1,9 +1,9 @@
 import torch
 import argparse
 
-from nerf.provider import NeRFDataset
+from nerf_sem.provider import NeRFDataset
 from nerf.gui import NeRFGUI
-from nerf.utils import *
+from nerf_sem.utils import *
 
 from functools import partial
 from loss import huber_loss
@@ -36,6 +36,7 @@ if __name__ == '__main__':
     parser.add_argument('--fp16', action='store_true', help="use amp mixed precision training")
     parser.add_argument('--ff', action='store_true', help="use fully-fused MLP")
     parser.add_argument('--tcnn', action='store_true', help="use TCNN backend")
+    parser.add_argument('--tcnn_sem', action='store_true', help="use TCNN semantic backend")
 
     ### dataset options
     parser.add_argument('--color_space', type=str, default='srgb', help="Color space, supports (linear, srgb)")
@@ -62,6 +63,17 @@ if __name__ == '__main__':
     parser.add_argument('--clip_text', type=str, default='', help="text input for CLIP guidance")
     parser.add_argument('--rand_pose', type=int, default=-1, help="<0 uses no rand pose, =0 only uses rand pose, >0 sample one rand pose every $ known poses")
 
+    ### GUI aabb bounding box for rendering
+    parser.add_argument('--bx', type=float, default=-2)
+    parser.add_argument('--by', type=float, default=-2)
+    parser.add_argument('--bz', type=float, default=-2)
+    parser.add_argument('--tx', type=float, default=2)
+    parser.add_argument('--ty', type=float, default=2)
+    parser.add_argument('--tz', type=float, default=2)
+
+    parser.add_argument('--save_iter', type=int, default=100)
+    parser.add_argument('--distortion_loss', action='store_true', help="distortion loss of mip nerf 360")
+
     opt = parser.parse_args()
 
     if opt.O:
@@ -82,7 +94,10 @@ if __name__ == '__main__':
     elif opt.tcnn:
         opt.fp16 = True
         assert opt.bg_radius <= 0, "background model is not implemented for --tcnn"
-        from nerf.network_tcnn import NeRFNetwork
+        if opt.tcnn_sem:
+            from nerf_sem.network_tcnn import NeRFNetwork
+        else:
+            from nerf.network_tcnn import NeRFNetwork
     else:
         from nerf.network import NeRFNetwork
 
@@ -98,11 +113,13 @@ if __name__ == '__main__':
         min_near=opt.min_near,
         density_thresh=opt.density_thresh,
         bg_radius=opt.bg_radius,
+        aabb_bounds=[opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz]
     )
     
     print(model)
 
     criterion = torch.nn.MSELoss(reduction='none')
+    criterion_sem = torch.nn.MSELoss(reduction='none')
     #criterion = partial(huber_loss, reduction='none')
     #criterion = torch.nn.HuberLoss(reduction='none', beta=0.1) # only available after torch 1.10 ?
 
@@ -111,7 +128,7 @@ if __name__ == '__main__':
     if opt.test:
         
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16, metrics=metrics, use_checkpoint=opt.ckpt)
+        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, criterion_sem=criterion_sem, fp16=opt.fp16, metrics=metrics, use_checkpoint=opt.ckpt)
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer)
@@ -137,12 +154,11 @@ if __name__ == '__main__':
         scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
 
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=50)
+        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, criterion_sem=criterion_sem, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=50, save_iter=opt.save_iter)
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer, train_loader)
             gui.render()
-        
         else:
             valid_loader = NeRFDataset(opt, device=device, type='val', downscale=1).dataloader()
 
