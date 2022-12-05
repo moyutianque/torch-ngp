@@ -792,45 +792,45 @@ class Trainer(object):
             'lr': self.optimizer.param_groups[0]['lr'],
         }
 
-        if val_data is not None and iters%self.save_iter == 0:
-            val_results = []
-            save_path = os.path.join(self.workspace, 'vis_eval')
-            os.makedirs(save_path, exist_ok=True)
-            psnr_list = []
-            psnr_list_oldview = []
-            for j, (p, im, im_sem) in enumerate(zip(*val_data)):
-                test_output = self.test_gui(
-                        p, train_loader._data.intrinsics, 
-                        im.shape[1], im.shape[0], bg_color=torch.ones(3, dtype=torch.float32)
-                    )
+        # if val_data is not None and iters%self.save_iter == 0:
+        #     val_results = []
+        #     save_path = os.path.join(self.workspace, 'vis_eval')
+        #     os.makedirs(save_path, exist_ok=True)
+        #     psnr_list = []
+        #     psnr_list_oldview = []
+        #     for j, (p, im, im_sem) in enumerate(zip(*val_data)):
+        #         test_output = self.test_gui(
+        #                 p, train_loader._data.intrinsics, 
+        #                 im.shape[1], im.shape[0], bg_color=torch.ones(3, dtype=torch.float32)
+        #             )
 
-                img_rgb = (im * 255).astype(np.uint8)
-                img_sem = (im_sem * 255).astype(np.uint8)
-                pred = (test_output['image'] * 255).astype(np.uint8)
-                pred_sem = (test_output['sem'] * 255).astype(np.uint8)
-                pred_depth = (test_output['depth'] * 255).astype(np.uint8)
+        #         img_rgb = (im * 255).astype(np.uint8)
+        #         img_sem = (im_sem * 255).astype(np.uint8)
+        #         pred = (test_output['image'] * 255).astype(np.uint8)
+        #         pred_sem = (test_output['sem'] * 255).astype(np.uint8)
+        #         pred_depth = (test_output['depth'] * 255).astype(np.uint8)
 
-                prefix = ''
-                if len(val_data[0])-j <= train_loader._data.test_len:
-                    prefix = 'newview'
-                    psnr_list.append(np_PSNR(img_rgb, pred))
-                else:
-                    psnr_list_oldview.append(np_PSNR(img_rgb, pred))
+        #         prefix = ''
+        #         if len(val_data[0])-j <= train_loader._data.test_len:
+        #             prefix = 'newview'
+        #             psnr_list.append(np_PSNR(img_rgb, pred))
+        #         else:
+        #             psnr_list_oldview.append(np_PSNR(img_rgb, pred))
 
-                cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}gt.png'), cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
-                cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_sem_{prefix}gt.png'), cv2.cvtColor(img_sem, cv2.COLOR_RGB2BGR))
-                cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
-                cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_sem_{prefix}.png'), cv2.cvtColor(pred_sem, cv2.COLOR_RGB2BGR))
-                cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_depth_{prefix}.png'), pred_depth)
-                val_results.append(test_output)
+        #         cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}gt.png'), cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+        #         cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_sem_{prefix}gt.png'), cv2.cvtColor(img_sem, cv2.COLOR_RGB2BGR))
+        #         cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
+        #         cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_sem_{prefix}.png'), cv2.cvtColor(pred_sem, cv2.COLOR_RGB2BGR))
+        #         cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_depth_{prefix}.png'), pred_depth)
+        #         val_results.append(test_output)
             
-            with open(os.path.join(save_path, 'psnr_records.txt'), 'a') as file:
-                file.write(f"PSNR results for iter {iters}\n")
-                file.write(' '.join(str(v) for v in psnr_list_oldview) + "\n")
-                file.write("Old view PSNR avg: "+ str(np.mean(psnr_list_oldview))+ "\n")
-                file.write(' '.join(str(v) for v in psnr_list) + "\n")
-                file.write("Novel view PSNR avg: "+ str(np.mean(psnr_list))+ "\n\n")
-            outputs.update({'val_data': val_results})
+        #     with open(os.path.join(save_path, 'psnr_records.txt'), 'a') as file:
+        #         file.write(f"PSNR results for iter {iters}\n")
+        #         file.write(' '.join(str(v) for v in psnr_list_oldview) + "\n")
+        #         file.write("Old view PSNR avg: "+ str(np.mean(psnr_list_oldview))+ "\n")
+        #         file.write(' '.join(str(v) for v in psnr_list) + "\n")
+        #         file.write("Novel view PSNR avg: "+ str(np.mean(psnr_list))+ "\n\n")
+        #     outputs.update({'val_data': val_results})
         return outputs
 
     
@@ -871,10 +871,12 @@ class Trainer(object):
         if downscale != 1:
             # TODO: have to permute twice with torch...
             preds = F.interpolate(preds.permute(0, 3, 1, 2), size=(H, W), mode='nearest').permute(0, 2, 3, 1).contiguous()
+            preds_sem = F.interpolate(preds_sem.permute(0, 3, 1, 2), size=(H, W), mode='nearest').permute(0, 2, 3, 1).contiguous()
             preds_depth = F.interpolate(preds_depth.unsqueeze(1), size=(H, W), mode='nearest').squeeze(1)
 
         if self.opt.color_space == 'linear':
             preds = linear_to_srgb(preds)
+            preds_sem = linear_to_srgb(preds_sem)
 
         pred = preds[0].detach().cpu().numpy()
         pred_depth = preds_depth[0].detach().cpu().numpy()

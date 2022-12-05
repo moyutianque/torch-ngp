@@ -11,9 +11,12 @@ class OrbitCamera:
     def __init__(self, W, H, r=2, fovy=60):
         self.W = W
         self.H = H
-        self.radius = r # camera distance from center
+        # self.radius = r # camera distance from center
+        self.radius = 0 # NOTE zehao modified: rotate along frame center
         self.fovy = fovy # in degree
-        self.center = np.array([0, 0, 0], dtype=np.float32) # look at this point
+        # self.center = np.array([0, 0, 0], dtype=np.float32) # look at this point
+        self.center = np.array([0, 0, -r], dtype=np.float32) # # NOTE zehao modified camera shift
+
         self.rot = R.from_quat([1, 0, 0, 0]) # init camera matrix: [[1, 0, 0], [0, -1, 0], [0, 0, 1]] (to suit ngp convention)
         self.up = np.array([0, 1, 0], dtype=np.float32) # need to be normalized!
 
@@ -43,7 +46,7 @@ class OrbitCamera:
         rotvec_x = self.up * np.radians(-0.1 * dx)
         rotvec_y = side * np.radians(-0.1 * dy)
         self.rot = R.from_rotvec(rotvec_x) * R.from_rotvec(rotvec_y) * self.rot
-
+    
     def scale(self, delta):
         self.radius *= 1.1 ** (-delta)
 
@@ -125,6 +128,8 @@ class NeRFGUI:
     def prepare_buffer(self, outputs):
         if self.mode == 'image':
             return outputs['image']
+        elif self.mode == 'sem':
+            return outputs['sem']
         else:
             return np.expand_dims(outputs['depth'], -1).repeat(3, -1)
 
@@ -294,7 +299,7 @@ class NeRFGUI:
                     self.mode = app_data
                     self.need_update = True
                 
-                dpg.add_combo(('image', 'depth'), label='mode', default_value=self.mode, callback=callback_change_mode)
+                dpg.add_combo(('image', 'depth', 'sem'), label='mode', default_value=self.mode, callback=callback_change_mode)
 
                 # bg_color picker
                 def callback_change_bg(sender, app_data):
@@ -397,7 +402,6 @@ class NeRFGUI:
 
             dx = app_data[1]
             dy = app_data[2]
-            print(dx, dy)
 
             self.cam.pan(dx, dy)
             self.need_update = True
@@ -406,31 +410,42 @@ class NeRFGUI:
                 dpg.set_value("_log_pose", str(self.cam.pose))
 
         def callback_camera_move(sender, app_data):
-            """ wasd (87,65,83,68) move and ijkl(73,74,75,76) rotate, er (69,81) for zoom in/out"""
+            """ 
+                wasd (87,65,83,68) move 
+                ijkl(73,74,75,76) rotate, 
+                eq (69,81) up, down
+                cz(67,90) zoom in/out
+            """
             if not dpg.is_item_focused("_primary_window"):
                 return
-            if app_data in {87, 65, 83, 68, 73, 74, 75, 76, 69, 81}:
+            if app_data in {87, 65, 83, 68, 73, 74, 75, 76, 69, 81, 67, 90}:
                 # move
                 if app_data == 87: # w
-                    self.cam.pan(0, 100)
+                    self.cam.pan(0, 0, -200)
                 elif app_data == 83: # s
-                    self.cam.pan(0, -100)
+                    self.cam.pan(0, 0, 200)
                 elif app_data==65: # a
                     self.cam.pan(100, 0)
                 elif app_data==68: # d
                     self.cam.pan(-100, 0)
                 # rotate
                 elif app_data == 73: # i
-                    self.cam.orbit(0, -20)
+                    self.cam.orbit(0, -50)
                 elif app_data == 75: # k
-                    self.cam.orbit(0, 20)
+                    self.cam.orbit(0, 50)
                 elif app_data==74: # j
-                    self.cam.orbit(-20, 0)
+                    self.cam.orbit(-50, 0)
                 elif app_data==76: # l
-                    self.cam.orbit(20, 0)
+                    self.cam.orbit(50, 0)
+                # up down
                 elif app_data == 69: # e
+                    self.cam.pan(0, 100)
+                elif app_data == 81: # q
+                    self.cam.pan(0, -100)
+                # zoom in out
+                elif app_data == 67: #c
                     self.cam.scale(1)
-                else: # r
+                elif app_data == 90: # z
                     self.cam.scale(-1)
                 self.need_update = True
 
