@@ -86,7 +86,6 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
     j = j.t().reshape([1, H*W]).expand([B, H*W]) + 0.5
 
     results = {}
-
     if N > 0:
         N = min(N, H*W)
 
@@ -104,9 +103,9 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
             pi, pj = custom_meshgrid(torch.arange(patch_size, device=device), torch.arange(patch_size, device=device))
             offsets = torch.stack([pi.reshape(-1), pj.reshape(-1)], dim=-1) # [p^2, 2]
 
-            inds = inds.unsqueeze(1) + offsets.unsqueeze(0) # [np, p^2, 2]
+            inds = inds.unsqueeze(1) + offsets.unsqueeze(0) # [np, p^2, 2] zehao@Dec 7 all point coord of the patch
             inds = inds.view(-1, 2) # [N, 2]
-            inds = inds[:, 0] * W + inds[:, 1] # [N], flatten
+            inds = inds[:, 0] * W + inds[:, 1] # [N], flatten index
 
             inds = inds.expand([B, N])
 
@@ -135,18 +134,20 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
     else:
         inds = torch.arange(H*W, device=device).expand([B, H*W])
 
+    # NOTE zehao @ Dec 7 pixel coord to cam coord
     zs = torch.ones_like(i)
     xs = (i - cx) / fx * zs
     ys = (j - cy) / fy * zs
+
     directions = torch.stack((xs, ys, zs), dim=-1)
     directions = directions / torch.norm(directions, dim=-1, keepdim=True)
-    rays_d = directions @ poses[:, :3, :3].transpose(-1, -2) # (B, N, 3)
+    rays_d = directions @ poses[:, :3, :3].transpose(-1, -2) # (B, N, 3) # NOTE zehao cam coord to world coord
 
     rays_o = poses[..., :3, 3] # [B, 3]
     rays_o = rays_o[..., None, :].expand_as(rays_d) # [B, N, 3]
 
-    results['rays_o'] = rays_o
-    results['rays_d'] = rays_d
+    results['rays_o'] = rays_o # zehao ray origin
+    results['rays_d'] = rays_d # zehao ray direction
 
     return results
 
@@ -216,6 +217,13 @@ def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
     vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
     return vertices, triangles
 
+def depth_reg(depth_tensor):
+    """ [B, num_patch, patch_size, patch_size] """
+    i_mse = nn.functional.mse_loss(depth_tensor[:,:-1,:], depth_tensor[:,1:,:])
+    j_mse = nn.functional.mse_loss(depth_tensor[:,:,:-1], depth_tensor[:,:,1:]) 
+    
+    ds_loss = i_mse + j_mse
+    return ds_loss
 
 class PSNRMeter:
     def __init__(self):
@@ -470,7 +478,7 @@ class Trainer(object):
             loss = self.clip_loss(pred_rgb)
             
             return pred_rgb, None, loss
-
+        
         images = data['images'] # [B, N, 3/4]
         gt_sem = data['images_sem']
 
@@ -496,7 +504,10 @@ class Trainer(object):
 
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
         # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
-    
+        outputs_rd = None
+        if 'rd_rays_o' in data:
+            outputs_rd = self.model.render(data['rd_rays_o'], data['rd_rays_d'], staged=False, bg_color=torch.rand(3, device=self.device), perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
+
         pred_rgb = outputs['image']
         pred_sem = outputs['image_sem']
 
@@ -515,15 +526,25 @@ class Trainer(object):
 
         # NOTE by zehao, default this is not called
         # # patch-based rendering
-        # if self.opt.patch_size > 1: 
-        #     gt_rgb = gt_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
-        #     pred_rgb = pred_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
+        loss_ds = None
+        if self.opt.patch_size > 1: 
+            gt_rgb = gt_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
+            pred_rgb = pred_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
+            gt_sem = gt_sem.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
+            pred_sem = pred_sem.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
 
-        #     # torch_vis_2d(gt_rgb[0])
-        #     # torch_vis_2d(pred_rgb[0])
+            # torch_vis_2d(gt_rgb[0])
+            # torch_vis_2d(pred_rgb[0])
 
-        #     # LPIPS loss [not useful...]
-        #     loss = loss + 1e-3 * self.criterion_lpips(pred_rgb, gt_rgb)
+            # LPIPS loss [not useful...]
+            # loss = loss + 1e-3 * self.criterion_lpips(pred_rgb, gt_rgb) + 1e-3 * self.criterion_lpips(pred_sem, gt_sem)
+
+            pred_depth = outputs['depth'].view(-1, self.opt.patch_size, self.opt.patch_size)
+            if self.opt.depth_reg:
+                loss_ds = depth_reg(pred_depth)
+                if outputs_rd is not None:
+                    pred_depth2 = outputs_rd['depth'].view(-1, self.opt.patch_size, self.opt.patch_size)
+                    loss_ds += depth_reg(pred_depth2)
 
         # # special case for CCNeRF's rank-residual training
         # if len(loss.shape) == 3: # [K, B, N]
@@ -563,8 +584,14 @@ class Trainer(object):
         # pred_weights_sum = outputs['weights_sum'] + 1e-8
         # loss_ws = - 1e-1 * pred_weights_sum * torch.log(pred_weights_sum) # entropy to encourage weights_sum to be 0 or 1.
         # loss = loss + loss_ws.mean()
+        loss = {
+            'loss_rgb': loss_rgb,
+            'loss_sem': loss_sem,
+            'loss_dist': loss_dist,
+            'loss_ds': loss_ds
+        }
 
-        return pred_rgb, gt_rgb, loss_rgb, loss_sem, loss_dist
+        return pred_rgb, gt_rgb, loss
 
     def eval_step(self, data):
 
@@ -632,6 +659,23 @@ class Trainer(object):
         mesh.export(save_path)
 
         self.log(f"==> Finished saving mesh.")
+    
+    def save_3dmap(self, resolution=256):
+        # save_path = os.path.join(self.workspace, f'{self.name}_3dmap.ply')
+        # os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        # def query_func(pts):
+        #     with torch.no_grad():
+        #         with torch.cuda.amp.autocast(enabled=self.fp16):
+        #             import ipdb;ipdb.set_trace() # breakpoint 670
+        #             density_outputs = self.model.density(pts.to(self.device))
+        #             sem_out = self.model.sem(pts.to(self.device), **density_outputs)
+        #     return sem_out
+        
+        # outputs = extract_fields(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, query_func=query_func)
+        # import ipdb;ipdb.set_trace() # breakpoint 676
+        print()
+        print()
 
     ### ------------------------------
 
@@ -725,6 +769,7 @@ class Trainer(object):
 
         total_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
         total_loss_sem = torch.tensor([0], dtype=torch.float32, device=self.device)
+        total_loss_ds = torch.tensor([0], dtype=torch.float32, device=self.device)
         
         loader = iter(train_loader)
 
@@ -751,18 +796,27 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss, loss_sem, loss_dist = self.train_step(data)
+                preds, truths, loss_dict = self.train_step(data)
             
-            tot_loss = loss
+            tot_loss = loss_dict['loss_rgb'].clone()
             # NOTE: loss merge
-            if loss_sem is not None:
-                tot_loss += loss_sem
+            if loss_dict['loss_sem'] is not None:
+                tot_loss += loss_dict['loss_sem']
                 
-            if loss_dist is not None:
-                tot_loss += loss_dist
+            # if loss_dict['loss_dist'] is not None:
+            #     tot_loss += loss_dict['loss_dist']
+            
+            # if loss_dict['loss_ds'] is not None:
+            #     tot_loss += loss_dict['loss_ds'] 
+
+            # NOTE: add regularization
+            # l1_norm = sum(torch.norm(p,1) for p in self.model.parameters())
+            # l1_lambda = 0.00001
+            # tot_loss += l1_lambda * l1_norm
 
             self.scaler.scale(tot_loss).backward()
-            # self.scaler.scale(loss).backward() # NOTE only RGB loss
+            # self.scaler.scale(loss_dict['loss_rgb']).backward() # NOTE only RGB loss
+
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -770,15 +824,19 @@ class Trainer(object):
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
 
-            total_loss += loss.detach()
-            if loss_sem is not None:
-                total_loss_sem += loss_sem.detach()
+            total_loss += loss_dict['loss_rgb'].detach()
+            if loss_dict['loss_sem'] is not None:
+                total_loss_sem += loss_dict['loss_sem'].detach()
+            
+            if loss_dict['loss_ds'] is not None:
+                total_loss_ds += loss_dict['loss_sem'].detach()
 
         if self.ema is not None:
             self.ema.update()
 
         average_loss = total_loss.item() / step
         average_loss_sem = total_loss_sem.item() / step
+        average_loss_ds = total_loss_ds.item() / step
 
         if not self.scheduler_update_every_step:
             if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -787,8 +845,9 @@ class Trainer(object):
                 self.lr_scheduler.step()
 
         outputs = {
-            'loss': average_loss,
-            'loss_sem': average_loss_sem,
+            'l_rgb': average_loss,
+            'l_sem': average_loss_sem,
+            'l_ds':average_loss_ds,
             'lr': self.optimizer.param_groups[0]['lr'],
         }
 

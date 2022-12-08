@@ -118,8 +118,8 @@ class NeRFDataset:
         
         # NOTE only for replica purpose
         #test_index = [22, 114, 158, 159, 169] # scene 17DRP5sb8fy
-        test_index = [17,18,19,20, 65, 87, 124, 145] # replica apartment 2
-        verify_index = [60, 62, 81,82,116,117,133,134]
+        test_index = [17, 18, 19, 20, 65, 87, 124, 145] # replica apartment 2
+        verify_index = [60, 62, 81, 82, 116, 117, 133, 134]
         self.test_len = len(test_index)
 
         # load image size
@@ -331,6 +331,13 @@ class NeRFDataset:
         if error_map is not None:
             results['index'] = index
             results['inds_coarse'] = rays['inds_coarse']
+        
+        # NOTE: pad random patch only for depth regularization
+        if self.opt.depth_reg:
+            sample_size = 4
+            rd_poses = rand_poses(sample_size, self.device, radius=self.radius)
+            rd_rays = get_rays(rd_poses, self.intrinsics, self.H, self.W, self.num_rays//2, error_map=None, patch_size=self.opt.patch_size)
+            results.update({'rd_rays_o': rd_rays['rays_o'], 'rd_rays_d': rd_rays['rays_d']})
             
         return results
 

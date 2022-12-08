@@ -73,6 +73,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--save_iter', type=int, default=100)
     parser.add_argument('--distortion_loss', action='store_true', help="distortion loss of mip nerf 360")
+    parser.add_argument('--depth_reg', action='store_true', help="depth regularization loss of regnerf")
 
     opt = parser.parse_args()
 
@@ -147,6 +148,7 @@ if __name__ == '__main__':
     else:
 
         optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
+        # optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15, weight_decay=1e-5) # NOTE zehao add L2 normalization on weights
 
         train_loader = NeRFDataset(opt, device=device, type='train').dataloader()
 

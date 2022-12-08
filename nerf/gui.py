@@ -113,8 +113,8 @@ class NeRFGUI:
         self.need_update = True
 
         dpg.set_value("_log_train_time", f'{t:.4f}ms ({int(1000/t)} FPS)')
-        if "loss_sem" in outputs.keys():
-            dpg.set_value("_log_train_log", f'step = {self.step: 5d} (+{self.train_steps: 2d}), lrgb = {outputs["loss"]:.4f}, lsem = {outputs["loss_sem"]:.4f}, lr = {outputs["lr"]:.5f}')
+        if "l_sem" in outputs.keys():
+            dpg.set_value("_log_train_log", f'step = {self.step: 5d} (+{self.train_steps: 2d}), lrgb = {outputs["l_rgb"]:.4f}, lsem = {outputs["l_sem"]:.4f}, lds = {outputs["l_ds"]:.4f}, lr = {outputs["lr"]:.5f}')
         else:
             dpg.set_value("_log_train_log", f'step = {self.step: 5d} (+{self.train_steps: 2d}), loss = {outputs["loss"]:.4f}, lr = {outputs["lr"]:.5f}')
 
@@ -188,7 +188,7 @@ class NeRFGUI:
         dpg.set_primary_window("_primary_window", True)
 
         # control window
-        with dpg.window(label="Control", tag="_control_window", width=400, height=300):
+        with dpg.window(label="Control", tag="_control_window", width=500, height=300):
 
             # button theme
             with dpg.theme() as theme_button:
@@ -272,6 +272,18 @@ class NeRFGUI:
                         dpg.bind_item_theme("_button_mesh", theme_button)
 
                         dpg.add_text("", tag="_log_mesh")
+                    
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("voxelized map: ")
+
+                        def callback_save_map(sender, app_data):
+                            self.trainer.save_3dmap()
+                            dpg.set_value("_log_3dmap", "saved " + f'{self.trainer.name}_3dmap.ply')
+
+                        dpg.add_button(label="save_map", tag="_button_3dmap", callback=callback_save_map)
+                        dpg.bind_item_theme("_button_3dmap", theme_button)
+
+                        dpg.add_text("", tag="_log_3dmap")
 
                     with dpg.group(horizontal=True):
                         dpg.add_text("", tag="_log_train_log")
@@ -489,9 +501,10 @@ class NeRFGUI:
             # update texture every frame
             if self.training:
                 self.train_step()
-                if self.step > self.opt.iters:
-                    self.test_step()
-                    dpg.render_dearpygui_frame()
-                    break
+                # NOTE: zehao temporally add novel view synthesis in gui mode
+                # if self.step > self.opt.iters:
+                #     self.test_step()
+                #     dpg.render_dearpygui_frame()
+                #     break
             self.test_step()
             dpg.render_dearpygui_frame()
