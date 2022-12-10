@@ -21,7 +21,6 @@ class NeRFNetwork(NeRFRenderer):
                  hidden_dim_sem = 64,
                  num_layers_sem=2,
                  sem_out_dim=3,
-                 sem_activation='sigmoid',
                  bound=1,
                  **kwargs
                  ):
@@ -95,15 +94,17 @@ class NeRFNetwork(NeRFRenderer):
                 "n_hidden_layers": num_layers_sem - 1,
             },
         )
+
         self.sem_out_dim = sem_out_dim
-        self.sem_activation = sem_activation
-
-
     
+    def sem_activation(self, x):
+        # return torch.nn.functional.softmax(x, dim=-1)
+        # return torch.sigmoid(x)
+        return x
+       
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
-
 
         # sigma
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
@@ -127,11 +128,9 @@ class NeRFNetwork(NeRFRenderer):
         
         # sigmoid activation for rgb
         color = torch.sigmoid(h)
-
-        if self.sem_activation == 'sigmoid':
-            sem = torch.sigmoid(h_sem)
-        else:
-            raise NotImplementedError()
+        
+        sem = self.sem_activation(h_sem)
+        # sem = h_sem
 
         return sigma, color, sem
 
@@ -190,26 +189,24 @@ class NeRFNetwork(NeRFRenderer):
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
 
         if mask is not None:
-            rgbs = torch.zeros(mask.shape[0], 3, dtype=geo_feat.dtype, device=geo_feat.device) # [N, 3]
+            sems = torch.zeros(mask.shape[0], self.sem_out_dim, dtype=x.dtype, device=x.device) # [N, sem_out_dim]
             # in case of empty mask
             if not mask.any():
-                return rgbs
+                return sems
             x = x[mask]
             geo_feat = geo_feat[mask]
 
         # sem
-        h = geo_feat
-        h = self.sem_net(h)
+        h = self.sem_net(geo_feat)
+
+        h = self.sem_activation(h)
         
-        # sigmoid activation for rgb
-        h = torch.sigmoid(h)
-
         if mask is not None:
-            rgbs[mask] = h.to(rgbs.dtype) # fp16 --> fp32
+            sems[mask] = h.to(sems.dtype) # fp16 --> fp32
         else:
-            rgbs = h
+            sems = h
 
-        return rgbs       
+        return sems       
 
     # optimizer utils
     def get_params(self, lr):

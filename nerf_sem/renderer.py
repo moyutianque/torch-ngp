@@ -237,10 +237,11 @@ class NeRFRenderer(nn.Module):
         rgbs = rgbs.view(N, -1, 3) # [N, T+t, 3]
 
         rgbs_sem = self.sem(xyzs.reshape(-1, 3), mask=mask.reshape(-1), **density_outputs)
-        rgbs_sem = rgbs_sem.view(N, -1, 3) # [N, T+t, 3]
+        rgbs_sem = rgbs_sem.view(N, -1, self.sem_out_dim) # [N, T+t, self.sem_out_dim]
 
         #print(xyzs.shape, 'valid_rgb:', mask.sum().item())
-        dist_loss = 0.05* eff_distloss(weights2[:, 1:], z_vals_mid, interval)
+        # dist_loss = 0.05* eff_distloss(weights2[:, 1:], z_vals_mid, interval) # 360 distortion loss
+        dist_loss = None
 
         # calculate weight_sum (mask)
         weights_sum = weights.sum(dim=-1) # [N]
@@ -250,10 +251,10 @@ class NeRFRenderer(nn.Module):
         depth = torch.sum(weights * ori_z_vals, dim=-1)
 
         # calculate color
-        image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 3], in [0, 1]
+        image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 100], in [0, 1]
 
         # calculate sem
-        image_sem = torch.sum(weights.unsqueeze(-1) * rgbs_sem, dim=-2) # [N, 3], in [0, 1]
+        image_sem = torch.sum(weights.unsqueeze(-1) * rgbs_sem, dim=-2) # [N, self.sem_out_dim], in [0, 1]
 
         # mix background color
         if self.bg_radius > 0:
@@ -262,13 +263,15 @@ class NeRFRenderer(nn.Module):
             bg_color = self.background(sph, rays_d.reshape(-1, 3)) # [N, 3]
         elif bg_color is None:
             bg_color = 1
-        sem_bg_color = torch.zeros(3, device=device) # [3]
+
+        # sem_bg_color = torch.zeros(self.sem_out_dim, device=device) # [sem_out_dim]
+        sem_bg_color=1
 
         image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
         image = image.view(*prefix, 3)
 
         image_sem = image_sem + (1 - weights_sum).unsqueeze(-1) * sem_bg_color
-        image_sem = image_sem.view(*prefix, 3)
+        image_sem = image_sem.view(*prefix, self.sem_out_dim)
 
         depth = depth.view(*prefix)
 
@@ -308,7 +311,8 @@ class NeRFRenderer(nn.Module):
         elif bg_color is None:
             bg_color = 1
 
-        sem_bg_color = torch.zeros(3, device=device) # [3]
+        # sem_bg_color = torch.zeros(self.sem_out_dim, device=device) # [3]
+        sem_bg_color = 1
         results = {}
 
         if self.training:
@@ -347,7 +351,7 @@ class NeRFRenderer(nn.Module):
             else:
 
                 weights_sum, depth, image = raymarching.composite_rays_train(sigmas, rgbs, deltas, rays, T_thresh)
-                weights_sum_sem, _, image_sem = raymarching.composite_rays_train(sigmas, sems, deltas, rays, T_thresh)
+                weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas, sems, deltas, rays, T_thresh)
                 image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
                 image_sem = image_sem + (1 - weights_sum_sem).unsqueeze(-1) * sem_bg_color
 
@@ -369,7 +373,6 @@ class NeRFRenderer(nn.Module):
             weights_sum = torch.zeros(N, dtype=dtype, device=device)
             depth = torch.zeros(N, dtype=dtype, device=device)
             image = torch.zeros(N, 3, dtype=dtype, device=device)
-            image_sem = torch.zeros(N, self.sem_out_dim, dtype=dtype, device=device)
             
             n_alive = N # NOTE: resolution of the GUI W*H
             rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
@@ -441,10 +444,17 @@ class NeRFRenderer(nn.Module):
                 sigmas, rgbs, sems = self(xyzs, dirs)
                 sigmas = self.density_scale * sigmas
 
-                raymarching.composite_rays(
+                # id version
+                raymarching.composite_rays_sem(
                     n_alive, n_step, rays_alive, rays_t, sigmas, sems, deltas, 
-                    weights_sum, depth_tmp, image_sem, T_thresh
+                    weights_sum, depth_tmp, image_sem, T_thresh, self.sem_out_dim
                 )
+
+                # rgb version
+                # raymarching.composite_rays(
+                #     n_alive, n_step, rays_alive, rays_t, sigmas, sems, deltas, 
+                #     weights_sum, depth_tmp, image_sem, T_thresh
+                # )
 
                 rays_alive = rays_alive[rays_alive >= 0]
                 step += n_step

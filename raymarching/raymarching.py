@@ -290,6 +290,63 @@ class _composite_rays_train(Function):
 
 composite_rays_train = _composite_rays_train.apply
 
+
+class _composite_rays_train_sem(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32)
+    def forward(ctx, sigmas, rgbs, deltas, rays, T_thresh=1e-4):
+        ''' composite rays' rgbs, according to the ray marching formula.
+        Args:
+            sems: float, [M, sem_dim]
+            sigmas: float, [M,]
+            deltas: float, [M, 2]
+            rays: int32, [N, 3]
+        Returns:
+            weights_sum: float, [N,], the alpha channel
+            depth: float, [N, ], the Depth
+            image: float, [N, 3], the RGB channel (after multiplying alpha!)
+        '''
+        
+        sigmas = sigmas.contiguous()
+        rgbs = rgbs.contiguous()
+
+        M = sigmas.shape[0]
+        N = rays.shape[0]
+
+        weights_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        depth = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        image = torch.empty(N, rgbs.shape[1], dtype=sigmas.dtype, device=sigmas.device)
+
+        _backend.composite_rays_train_forward_sem(sigmas, rgbs, deltas, rays, M, N, T_thresh, weights_sum, depth, image, rgbs.shape[1])
+
+        ctx.save_for_backward(sigmas, rgbs, deltas, rays, weights_sum, depth, image)
+        ctx.dims = [M, N, T_thresh]
+
+        return weights_sum, depth, image
+    
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_weights_sum, grad_depth, grad_image):
+
+        # NOTE: grad_depth is not used now! It won't be propagated to sigmas.
+
+        grad_weights_sum = grad_weights_sum.contiguous()
+        grad_image = grad_image.contiguous()
+
+        sigmas, rgbs, deltas, rays, weights_sum, depth, image = ctx.saved_tensors
+        M, N, T_thresh = ctx.dims
+   
+        grad_sigmas = torch.zeros_like(sigmas)
+        grad_rgbs = torch.zeros_like(rgbs)
+        tmp_tensor = torch.zeros_like(rgbs)
+
+        _backend.composite_rays_train_backward_sem(grad_weights_sum, grad_image, sigmas, rgbs, deltas, rays, weights_sum, image, M, N, T_thresh, grad_sigmas, grad_rgbs, rgbs.shape[1], tmp_tensor)
+
+        return grad_sigmas, grad_rgbs, None, None, None
+
+
+composite_rays_train_sem = _composite_rays_train_sem.apply
+
 # ----------------------------------------
 # infer functions
 # ----------------------------------------
@@ -371,3 +428,28 @@ class _composite_rays(Function):
 
 
 composite_rays = _composite_rays.apply
+
+
+class _composite_rays_sem(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32) # need to cast sigmas & rgbs to float
+    def forward(ctx, n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image, T_thresh=1e-2, sem_out_dim=3):
+        ''' composite rays' rgbs, according to the ray marching formula. (for inference)
+        Args:
+            n_alive: int, number of alive rays
+            n_step: int, how many steps we march
+            rays_alive: int, [n_alive], the alive rays' IDs in N (N >= n_alive)
+            rays_t: float, [N], the alive rays' time
+            sigmas: float, [n_alive * n_step,]
+            rgbs: float, [n_alive * n_step, 3]
+            deltas: float, [n_alive * n_step, 2], all generated points' deltas (here we record two deltas, the first is for RGB, the second for depth).
+        In-place Outputs:
+            weights_sum: float, [N,], the alpha channel
+            depth: float, [N,], the depth value
+            image: float, [N, 3], the RGB channel (after multiplying alpha!)
+        '''
+        _backend.composite_rays_sem(n_alive, n_step, T_thresh, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image, sem_out_dim)
+        return tuple()
+
+
+composite_rays_sem = _composite_rays_sem.apply

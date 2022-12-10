@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from .utils import get_rays
 
+from scipy import interpolate
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
 def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
@@ -120,7 +121,13 @@ class NeRFDataset:
         #test_index = [22, 114, 158, 159, 169] # scene 17DRP5sb8fy
         test_index = [17, 18, 19, 20, 65, 87, 124, 145] # replica apartment 2
         verify_index = [60, 62, 81, 82, 116, 117, 133, 134]
+
+        # replica apartment 2 dining room
+        test_index = []
+        verify_index = []
         self.test_len = len(test_index)
+
+        self.target_labels = set() # only for classification sem model
 
         # load image size
         if 'h' in transform and 'w' in transform:
@@ -160,26 +167,45 @@ class NeRFDataset:
 
             self.poses = []
             self.images = []
-            self.images_sem = []
+            self.sem_datas = []
+            self.sem_label_map = []
 
             self.poses_extra = []
             self.images_extra = []
-            self.images_sem_extra = []
+            self.sem_datas_extra = []
+
             for k, f in enumerate(tqdm.tqdm(frames, desc=f'Loading {type} data')):
-                f_path = os.path.join(self.root_path, f['file_path'])
-                f_path_sem = os.path.join(self.root_path, f['sem_path'])
+                f_path = os.path.join(self.root_path, f['file_path']) # rgb
+
+                img_idx = f['file_path'].split('/')[-1].split('.')[0]
+                if self.opt.sem_mode == 'label_rgb':
+                    f_path_sem = os.path.join(self.root_path, 'sem', f"{img_idx}-label.png")
+                    sem_data = cv2.imread(f_path_sem, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
+                elif self.opt.sem_mode == 'ins_rgb':
+                    f_path_sem = os.path.join(self.root_path, 'sem', f"{img_idx}-ins.png")
+                    sem_data = cv2.imread(f_path_sem, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
+                elif self.opt.sem_mode == 'label_id':
+                    f_path_sem = os.path.join(self.root_path, 'sem', f"{img_idx}-label.npy")
+                    sem_data = np.load(f_path_sem)
+                    self.target_labels = self.target_labels.union(set(np.unique(sem_data)))
+                    sem_data[sem_data==-100] = 0
+                elif self.opt.sem_mode == 'ins_id':
+                    f_path_sem = os.path.join(self.root_path, 'sem', f"{img_idx}-instance.npy")
+                    sem_data = np.load(f_path_sem)
+                    self.target_labels = self.target_labels.union(set(np.unique(sem_data)))
+                    sem_data[sem_data==-100] = 0
+                else:
+                    raise ValueError("Please check input argument sem_mode")
 
                 # there are non-exist paths in fox...
                 if not os.path.exists(f_path):
-                    raise FileNotFoundError(f"Please check transforms.json file_path = {f_path}")
-                if not os.path.exists(f_path_sem):
                     raise FileNotFoundError(f"Please check transforms.json file_path = {f_path}")
                 
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
                 pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
 
                 image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
-                image_sem = cv2.imread(f_path_sem, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
+                
                 if self.H is None or self.W is None:
                     self.H = image.shape[0] // downscale
                     self.W = image.shape[1] // downscale
@@ -190,29 +216,37 @@ class NeRFDataset:
                 else:
                     image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
                 
-                if len(image_sem.shape) == 2:
-                    # for single value semantic map
-                    raise NotImplementedError()
-                else:
-                    image_sem = cv2.cvtColor(image_sem, cv2.COLOR_BGR2RGB)
-
                 if image.shape[0] != self.H or image.shape[1] != self.W:
                     image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
-                if image_sem.shape[0] != self.H or image_sem.shape[1] != self.W:
-                    image_sem = cv2.resize(image_sem, (self.W, self.H), interpolation=cv2.INTER_AREA)
-                    
+
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
-                if len(image_sem.shape) == 3:
-                    image_sem = image_sem.astype(np.float32) / 255
+
+                if 'rgb' in self.opt.sem_mode:
+                    if len(sem_data.shape) == 2:
+                        # for single value semantic map
+                        raise NotImplementedError()
+                    else:
+                        sem_data = cv2.cvtColor(sem_data, cv2.COLOR_BGR2RGB)
+
+                    if sem_data.shape[0] != self.H or sem_data.shape[1] != self.W:
+                        sem_data = cv2.resize(sem_data, (self.W, self.H), interpolation=cv2.INTER_AREA)
+                        
+                    sem_data = sem_data.astype(np.float32) / 255
+                elif 'id' in self.opt.sem_mode:
+                    if sem_data.shape[0] != self.H or sem_data.shape[1] != self.W:
+                        sem_data = cv2.resize(sem_data, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
+                else:
+                    pass
 
                 if k in test_index:
                     self.poses_extra.append(pose)
                     self.images_extra.append(image)
-                    self.images_sem_extra.append(image_sem)
+                    self.sem_datas_extra.append(sem_data)
                 else:
                     self.poses.append(pose)
                     self.images.append(image)
-                    self.images_sem.append(image_sem)
+                    self.sem_datas.append(sem_data)
+
 
         # NOTE: copy a set of frames as verification of training quality
         # self.poses_verify = [p for i, p in enumerate(self.poses) if i%self.val_sample_step==0 ]
@@ -220,17 +254,18 @@ class NeRFDataset:
         # self.images_sem_verify = [im for i, im in enumerate(self.images_sem) if i%self.val_sample_step==0 ]
         self.poses_verify = [p for i, p in enumerate(self.poses) if i in verify_index ]
         self.images_verify = [im for i, im in enumerate(self.images) if i in verify_index ]
-        self.images_sem_verify = [im for i, im in enumerate(self.images_sem) if i in verify_index ]
+        self.sem_datas_verify = [im for i, im in enumerate(self.sem_datas) if i in verify_index ]
+
         # TODO: append several not trained data
         self.poses_verify += self.poses_extra
         self.images_verify += self.images_extra
-        self.images_sem_verify += self.images_sem_extra
+        self.sem_datas_verify += self.sem_datas_extra
 
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
-        if self.images_sem is not None:
-            self.images_sem = torch.from_numpy(np.stack(self.images_sem, axis=0))
+        if self.sem_datas is not None:
+            self.sem_datas = torch.from_numpy(np.stack(self.sem_datas, axis=0))
  
         # calculate mean radius of all camera poses
         self.radius = self.poses[:, :3, 3].norm(dim=-1).mean(0).item()
@@ -243,7 +278,7 @@ class NeRFDataset:
             self.error_map = None
 
         # [debug] uncomment to view all training poses.
-        visualize_poses(self.poses.numpy())
+        # visualize_poses(self.poses.numpy())
 
         # [debug] uncomment to view examples of randomly generated poses.
         # visualize_poses(rand_poses(100, self.device, radius=self.radius).cpu().numpy())
@@ -257,7 +292,7 @@ class NeRFDataset:
                 else:
                     dtype = torch.float
                 self.images = self.images.to(dtype).to(self.device)
-                self.images_sem = self.images_sem.to(dtype).to(self.device)
+                self.sem_datas = self.sem_datas.to(dtype).to(self.device)
             if self.error_map is not None:
                 self.error_map = self.error_map.to(self.device)
 
@@ -278,6 +313,12 @@ class NeRFDataset:
         cy = (transform['cy'] / downscale) if 'cy' in transform else (self.H / 2)
     
         self.intrinsics = np.array([fl_x, fl_y, cx, cy])
+    
+    @property
+    def num_labels(self):
+        if len(self.target_labels) == 0:
+            return 3
+        return max(self.target_labels) + 1
 
     def collate(self, index):
 
@@ -320,12 +361,16 @@ class NeRFDataset:
                 images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
             results['images'] = images
 
-        if self.images_sem is not None:
-            images_sem = self.images_sem[index].to(self.device) # [B, H, W, 3/4]
+        if self.sem_datas is not None:
+            sem_datas = self.sem_datas[index].to(self.device) # [B, H, W, none/3/4]
+
             if self.training:
-                C = images_sem.shape[-1]
-                images_sem = torch.gather(images_sem.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
-            results['images_sem'] = images_sem        
+                C = sem_datas.shape[-1]
+                if len(sem_datas.shape) == 3:
+                    sem_datas = torch.gather(sem_datas.view(B, -1), 1, rays['inds']) # [B, N]
+                else:
+                    sem_datas = torch.gather(sem_datas.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
+            results['images_sem'] = sem_datas 
         
         # need inds to update error_map
         if error_map is not None:

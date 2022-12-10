@@ -74,6 +74,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_iter', type=int, default=100)
     parser.add_argument('--distortion_loss', action='store_true', help="distortion loss of mip nerf 360")
     parser.add_argument('--depth_reg', action='store_true', help="depth regularization loss of regnerf")
+    parser.add_argument('--sem_mode', choices=['label_rgb', 'ins_rgb', 'label_id', 'ins_id'], default='ins_rgb', type=str)
 
     opt = parser.parse_args()
 
@@ -96,7 +97,11 @@ if __name__ == '__main__':
         opt.fp16 = True
         assert opt.bg_radius <= 0, "background model is not implemented for --tcnn"
         if opt.tcnn_sem:
-            from nerf_sem.network_tcnn import NeRFNetwork
+            if 'rgb' in opt.sem_mode:
+                from nerf_sem.network_tcnn import NeRFNetwork
+            else:
+                from nerf_sem.network_tcnn_insid import NeRFNetwork
+               
         else:
             from nerf.network_tcnn import NeRFNetwork
     else:
@@ -106,21 +111,14 @@ if __name__ == '__main__':
     
     seed_everything(opt.seed)
 
-    model = NeRFNetwork(
-        encoding="hashgrid",
-        bound=opt.bound,
-        cuda_ray=opt.cuda_ray,
-        density_scale=1,
-        min_near=opt.min_near,
-        density_thresh=opt.density_thresh,
-        bg_radius=opt.bg_radius,
-        aabb_bounds=[opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz]
-    )
-    
-    print(model)
 
     criterion = torch.nn.MSELoss(reduction='none')
-    criterion_sem = torch.nn.MSELoss(reduction='none')
+    if 'rgb' in opt.sem_mode:
+        criterion_sem = torch.nn.MSELoss(reduction='none')
+    else:
+        criterion_sem = torch.nn.CrossEntropyLoss(reduction='none')
+        # criterion_sem = torch.nn.BCEWithLogitsLoss(reduction='none')
+        
     #criterion = partial(huber_loss, reduction='none')
     #criterion = torch.nn.HuberLoss(reduction='none', beta=0.1) # only available after torch 1.10 ?
 
@@ -129,6 +127,19 @@ if __name__ == '__main__':
     if opt.test:
         
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
+        
+        # TODO currently not work for sem, because not modified
+        model = NeRFNetwork(
+            encoding="hashgrid",
+            bound=opt.bound,
+            cuda_ray=opt.cuda_ray,
+            density_scale=1,
+            min_near=opt.min_near,
+            density_thresh=opt.density_thresh,
+            bg_radius=opt.bg_radius,
+            aabb_bounds=[opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz]
+        )
+
         trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, criterion_sem=criterion_sem, fp16=opt.fp16, metrics=metrics, use_checkpoint=opt.ckpt)
 
         if opt.gui:
@@ -146,11 +157,23 @@ if __name__ == '__main__':
             trainer.save_mesh(resolution=256, threshold=10)
     
     else:
+        train_loader = NeRFDataset(opt, device=device, type='train').dataloader()
+        model = NeRFNetwork(
+            encoding="hashgrid",
+            bound=opt.bound,
+            cuda_ray=opt.cuda_ray,
+            density_scale=1,
+            min_near=opt.min_near,
+            density_thresh=opt.density_thresh,
+            bg_radius=opt.bg_radius,
+            aabb_bounds=[opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz],
+            sem_out_dim=train_loader._data.num_labels
+        )
+        
+        print(model)
 
         optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
         # optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15, weight_decay=1e-5) # NOTE zehao add L2 normalization on weights
-
-        train_loader = NeRFDataset(opt, device=device, type='train').dataloader()
 
         # decay to 0.1 * init_lr at last iter step
         scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))

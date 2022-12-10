@@ -202,6 +202,29 @@ def extract_fields(bound_min, bound_max, resolution, query_func, S=128):
                     u[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = val
     return u
 
+def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128):
+
+    X = torch.linspace(bound_min[0], bound_max[0], resolution).split(S)
+    Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(S)
+    Z = torch.linspace(bound_min[2], bound_max[2], resolution).split(S)
+
+    u_density = np.zeros([resolution, resolution, resolution], dtype=np.float32)
+    u_sem = np.zeros([resolution, resolution, resolution], dtype=np.float32)
+    with torch.no_grad():
+        for xi, xs in enumerate(X):
+            for yi, ys in enumerate(Y):
+                for zi, zs in enumerate(Z):
+                    xx, yy, zz = custom_meshgrid(xs, ys, zs)
+                    pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [S, 3]
+                    density, sem_out = query_func(pts)
+                    val = density.reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
+                    u_density[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = val
+
+                    sem_out = torch.argmax(sem_out, dim=-1)
+                    sem_val = sem_out.reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
+                    u_sem[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = sem_val
+    return u_density, u_sem
+
 
 def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
     #print('threshold: {}'.format(threshold))
@@ -470,7 +493,7 @@ class Trainer(object):
             outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, force_all_rays=True, **vars(self.opt))
             pred_rgb = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
 
-            pred_sem = outputs['image_sem'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
+            pred_sem = outputs['image_sem'].reshape(B, H, W, self.model.sem_out_dim).permute(0, 3, 1, 2).contiguous()
 
             # [debug] uncomment to plot the images used in train_step
             #torch_vis_2d(pred_rgb[0])
@@ -515,9 +538,19 @@ class Trainer(object):
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
 
         # NOTE: zehao sem loss
-        mask = torch.all(gt_sem==0, dim=2, keepdim=True).squeeze(-1)
-        
-        loss_sem = self.criterion_sem(pred_sem, gt_sem).mean(-1)
+        # mask = torch.all(gt_sem==0, dim=2, keepdim=True).squeeze(-1)
+        if len(gt_sem.shape) == 2:
+            gt_sem = gt_sem.view(-1).long()
+            loss_sem = self.criterion_sem(pred_sem.view(len(gt_sem), -1), gt_sem)
+            # BCE
+            # skip_idx = gt_sem != -100
+            # onehot_gt = torch.nn.functional.one_hot(gt_sem[skip_idx], num_classes=pred_sem.shape[2]).float()
+            # loss_sem = self.criterion_sem(
+            #     pred_sem.view(-1, pred_sem.shape[2])[skip_idx], 
+            #     onehot_gt
+            # )
+        else:
+            loss_sem = self.criterion_sem(pred_sem.view(-1, pred_sem.shape[2]), gt_sem).mean(-1)
         # loss_sem = loss_sem[~mask] 
 
         loss_dist = None
@@ -633,7 +666,7 @@ class Trainer(object):
 
         pred_rgb = outputs['image'].reshape(-1, H, W, 3)
         pred_depth = outputs['depth'].reshape(-1, H, W)
-        pred_sem = outputs['image_sem'].reshape(-1, H, W, 3)
+        pred_sem = outputs['image_sem'].reshape(-1, H, W, self.model.sem_out_dim)
 
         return pred_rgb, pred_depth, pred_sem
 
@@ -661,21 +694,18 @@ class Trainer(object):
         self.log(f"==> Finished saving mesh.")
     
     def save_3dmap(self, resolution=256):
-        # save_path = os.path.join(self.workspace, f'{self.name}_3dmap.ply')
-        # os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        save_path = os.path.join(self.workspace, f'{self.name}_3dmap.npy')
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        # def query_func(pts):
-        #     with torch.no_grad():
-        #         with torch.cuda.amp.autocast(enabled=self.fp16):
-        #             import ipdb;ipdb.set_trace() # breakpoint 670
-        #             density_outputs = self.model.density(pts.to(self.device))
-        #             sem_out = self.model.sem(pts.to(self.device), **density_outputs)
-        #     return sem_out
+        def query_func(pts):
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=self.fp16):
+                    density_outputs = self.model.density(pts.to(self.device))
+                    sem_out = self.model.sem(pts.to(self.device), **density_outputs)
+            return density_outputs['sigma'], sem_out
         
-        # outputs = extract_fields(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, query_func=query_func)
-        # import ipdb;ipdb.set_trace() # breakpoint 676
-        print()
-        print()
+        density_out, sem_out = extract_fields_sem(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, query_func=query_func)
+        np.save(save_path, {"density": density_out, "sem": sem_out})
 
     ### ------------------------------
 
@@ -936,6 +966,7 @@ class Trainer(object):
         if self.opt.color_space == 'linear':
             preds = linear_to_srgb(preds)
             preds_sem = linear_to_srgb(preds_sem)
+            print("[warning] color mode might be wrong")
 
         pred = preds[0].detach().cpu().numpy()
         pred_depth = preds_depth[0].detach().cpu().numpy()

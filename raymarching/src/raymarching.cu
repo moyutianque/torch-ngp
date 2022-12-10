@@ -518,15 +518,15 @@ __global__ void kernel_composite_rays_train_forward_sem(
     uint32_t offset = rays[n * 3 + 1];
     uint32_t num_steps = rays[n * 3 + 2];
 
+    for (int i=0;i<dim_out;i++){
+        image[index * dim_out + i] = 0;
+    }
+
     // empty ray, or ray that exceed max step count.
     if (num_steps == 0 || offset + num_steps > M) {
         weights_sum[index] = 0;
         depth[index] = 0;
 
-        for (int i=0;i<dim_out;i++)
-        {
-            image[index * dim_out + i] = 0;
-        }
         return;
     }
 
@@ -539,15 +539,6 @@ __global__ void kernel_composite_rays_train_forward_sem(
 
     scalar_t T = 1.0f;
     scalar_t ws = 0, t = 0, d = 0;
-    // const uint32_t NDIM = dim_out;
-    // // const uint32_t NDIM = 100;
-    scalar_t sem_copy[100];
-    // printf("---------------- 3 -------------------\n");
-    // scalar_t *sem_copy = new scalar_t[dim_out];
-    for (int i=0;i<dim_out;i++){
-        sem_copy[i] = 0;
-    }
-    // printf("---------------- 3 end -------------------\n");
 
     while (step < num_steps) {
 
@@ -555,7 +546,7 @@ __global__ void kernel_composite_rays_train_forward_sem(
         const scalar_t weight = alpha * T;
 
         for (int i=0;i<dim_out;i++){
-            sem_copy[i] += weight * rgbs[i];
+            image[index * dim_out + i] += weight * rgbs[i];
         }
         
         t += deltas[1]; // real delta
@@ -583,10 +574,6 @@ __global__ void kernel_composite_rays_train_forward_sem(
     // write
     weights_sum[index] = ws; // weights_sum
     depth[index] = d;
-    
-    for (int i=0;i<dim_out;i++){
-        image[index * dim_out + i] = sem_copy[i];
-    }
 
 }
 
@@ -625,7 +612,8 @@ __global__ void kernel_composite_rays_train_backward_sem(
     const uint32_t M, const uint32_t N, const float T_thresh,
     scalar_t * grad_sigmas,
     scalar_t * grad_rgbs,
-    const uint32_t dim_out
+    const uint32_t dim_out,
+    scalar_t * sem_copy
 ) {
     // parallel per ray
     const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
@@ -647,6 +635,7 @@ __global__ void kernel_composite_rays_train_backward_sem(
     deltas += offset * 2;
     grad_sigmas += offset;
     grad_rgbs += offset * dim_out;
+    sem_copy += offset * dim_out;
 
     // accumulate 
     uint32_t step = 0;
@@ -656,11 +645,6 @@ __global__ void kernel_composite_rays_train_backward_sem(
     const scalar_t ws_final = weights_sum[0];
     scalar_t ws = 0;
 
-    // const uint32_t NDIM = dim_out;
-    scalar_t sem_copy[100];
-    // const uint32_t NDIM = 100;
-    // printf("---------------- 2 -------------------\n");
-    // scalar_t *sem_copy = new scalar_t[dim_out];
     for (int i=0;i<dim_out;i++){
         sem_copy[i] = 0;
     }
@@ -708,13 +692,13 @@ __global__ void kernel_composite_rays_train_backward_sem(
 }
 
 
-void composite_rays_train_backward_sem(const at::Tensor grad_weights_sum, const at::Tensor grad_image, const at::Tensor sigmas, const at::Tensor rgbs, const at::Tensor deltas, const at::Tensor rays, const at::Tensor weights_sum, const at::Tensor image, const uint32_t M, const uint32_t N, const float T_thresh, at::Tensor grad_sigmas, at::Tensor grad_rgbs, const uint32_t dim_out) {
+void composite_rays_train_backward_sem(const at::Tensor grad_weights_sum, const at::Tensor grad_image, const at::Tensor sigmas, const at::Tensor rgbs, const at::Tensor deltas, const at::Tensor rays, const at::Tensor weights_sum, const at::Tensor image, const uint32_t M, const uint32_t N, const float T_thresh, at::Tensor grad_sigmas, at::Tensor grad_rgbs, const uint32_t dim_out,  at::Tensor sem_copy) {
 
     static constexpr uint32_t N_THREAD = 128;
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
     grad_image.scalar_type(), "composite_rays_train_backward_sem", ([&] {
-        kernel_composite_rays_train_backward_sem<<<div_round_up(N, N_THREAD), N_THREAD>>>(grad_weights_sum.data_ptr<scalar_t>(), grad_image.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), weights_sum.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), M, N, T_thresh, grad_sigmas.data_ptr<scalar_t>(), grad_rgbs.data_ptr<scalar_t>(), dim_out);
+        kernel_composite_rays_train_backward_sem<<<div_round_up(N, N_THREAD), N_THREAD>>>(grad_weights_sum.data_ptr<scalar_t>(), grad_image.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), weights_sum.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), M, N, T_thresh, grad_sigmas.data_ptr<scalar_t>(), grad_rgbs.data_ptr<scalar_t>(), dim_out, sem_copy.data_ptr<scalar_t>());
     }));
 }
 
@@ -1176,15 +1160,6 @@ __global__ void kernel_composite_rays_sem(
 
     scalar_t d = depth[0];
 
-    // // const uint32_t NDIM = 100;
-    scalar_t sem_copy[100];
-    // printf("---------------- 1 -------------------\n");
-    // scalar_t *sem_copy = new scalar_t[dim_out];
-    for (int i=0;i<dim_out;i++){
-        sem_copy[i] = image[i];
-    }
-    // printf("---------------- 1 end -------------------\n");
-
     // accumulate 
     uint32_t step = 0;
     while (step < n_step) {
@@ -1207,7 +1182,7 @@ __global__ void kernel_composite_rays_sem(
         t += deltas[1]; // real delta
         d += weight * t;
         for (int i=0; i< dim_out;i++){
-            sem_copy[i] += weight * rgbs[i];
+            image[i] += weight * rgbs[i];
         }
 
         //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
@@ -1234,10 +1209,6 @@ __global__ void kernel_composite_rays_sem(
 
     weights_sum[0] = weight_sum; // this is the thing I needed!
     depth[0] = d;
-
-    for (int i=0; i< dim_out;i++){
-        image[i] = sem_copy[i];
-    }
 
 }
 

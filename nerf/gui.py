@@ -5,7 +5,53 @@ import dearpygui.dearpygui as dpg
 from scipy.spatial.transform import Rotation as R
 
 from .utils import *
-
+from PIL import Image
+d3_40_colors_rgb: np.ndarray = np.array(
+    [
+        [1, 1, 1],
+        [31, 119, 180],
+        [174, 199, 232],
+        [255, 127, 14],
+        [255, 187, 120],
+        [44, 160, 44],
+        [152, 223, 138],
+        [214, 39, 40],
+        [255, 152, 150],
+        [148, 103, 189],
+        [197, 176, 213],
+        [140, 86, 75],
+        [196, 156, 148],
+        [227, 119, 194],
+        [247, 182, 210],
+        [127, 127, 127],
+        [199, 199, 199],
+        [188, 189, 34],
+        [219, 219, 141],
+        [23, 190, 207],
+        [158, 218, 229],
+        [57, 59, 121],
+        [82, 84, 163],
+        [107, 110, 207],
+        [156, 158, 222],
+        [99, 121, 57],
+        [140, 162, 82],
+        [181, 207, 107],
+        [206, 219, 156],
+        [140, 109, 49],
+        [189, 158, 57],
+        [231, 186, 82],
+        [231, 203, 148],
+        [132, 60, 57],
+        [173, 73, 74],
+        [214, 97, 107],
+        [231, 150, 156],
+        [123, 65, 115],
+        [165, 81, 148],
+        [206, 109, 189],
+        [222, 158, 214],
+    ],
+    dtype=np.uint8,
+)
 
 class OrbitCamera:
     def __init__(self, W, H, r=2, fovy=60):
@@ -73,7 +119,7 @@ class NeRFGUI:
         self.val_data = [
             train_loader._data.poses_verify, 
             train_loader._data.images_verify,
-            train_loader._data.images_sem_verify,
+            train_loader._data.sem_datas_verify,
         ]
 
         if train_loader is not None:
@@ -129,7 +175,12 @@ class NeRFGUI:
         if self.mode == 'image':
             return outputs['image']
         elif self.mode == 'sem':
-            return outputs['sem']
+            if "rgb" in self.opt.sem_mode:
+                return outputs['sem']
+            else:
+                outputs['sem'] = np.argmax(outputs['sem'], axis=-1).astype(int)
+                out_sem = d3_40_colors_rgb[outputs['sem'] % 40].astype(np.float32)/255.
+                return out_sem
         else:
             return np.expand_dims(outputs['depth'], -1).repeat(3, -1)
 
@@ -167,6 +218,8 @@ class NeRFGUI:
             dpg.set_value("_log_infer_time", f'{t:.4f}ms ({int(1000/t)} FPS)')
             dpg.set_value("_log_resolution", f'{int(self.downscale * self.W)}x{int(self.downscale * self.H)}')
             dpg.set_value("_log_spp", self.spp)
+            if os.environ.get('DEBUG', False): 
+                print(self.render_buffer.shape)
             dpg.set_value("_texture", self.render_buffer)
 
         
@@ -277,8 +330,10 @@ class NeRFGUI:
                         dpg.add_text("voxelized map: ")
 
                         def callback_save_map(sender, app_data):
-                            self.trainer.save_3dmap()
-                            dpg.set_value("_log_3dmap", "saved " + f'{self.trainer.name}_3dmap.ply')
+                            print("Start dumping 3d map")
+                            self.trainer.save_3dmap(resolution=512)
+                            print("Finish dumping 3d map")
+                            dpg.set_value("_log_3dmap", "saved " + f'{self.trainer.name}_3dmap.npy')
 
                         dpg.add_button(label="save_map", tag="_button_3dmap", callback=callback_save_map)
                         dpg.bind_item_theme("_button_3dmap", theme_button)
