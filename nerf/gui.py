@@ -113,6 +113,8 @@ class NeRFGUI:
         self.step = 0 # training step 
         self.global_iter = 0
 
+        self.map_res = 512
+
         self.trainer = trainer
         self.train_loader = train_loader
         
@@ -331,7 +333,7 @@ class NeRFGUI:
 
                         def callback_save_map(sender, app_data):
                             print("Start dumping 3d map")
-                            self.trainer.save_3dmap(resolution=512)
+                            self.trainer.save_3dmap(resolution=self.map_res)
                             print("Finish dumping 3d map")
                             dpg.set_value("_log_3dmap", "saved " + f'{self.trainer.name}_3dmap.npy')
 
@@ -339,6 +341,13 @@ class NeRFGUI:
                         dpg.bind_item_theme("_button_3dmap", theme_button)
 
                         dpg.add_text("", tag="_log_3dmap")
+                        
+                    with dpg.group(horizontal=True):    
+                        def callback_set_map_res(sender, app_data):
+                            self.map_res = int(app_data)
+                            self.need_update = True
+
+                        dpg.add_slider_int(label="Map resolution", min_value=256, max_value=2048, format="%d res.", default_value=self.map_res, callback=callback_set_map_res)
 
                     with dpg.group(horizontal=True):
                         dpg.add_text("", tag="_log_train_log")
