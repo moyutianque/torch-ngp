@@ -113,7 +113,7 @@ class NeRFGUI:
         self.step = 0 # training step 
         self.global_iter = 0
 
-        self.map_res = 512
+        self.map_res = 1080
 
         self.trainer = trainer
         self.train_loader = train_loader
@@ -220,6 +220,7 @@ class NeRFGUI:
             dpg.set_value("_log_infer_time", f'{t:.4f}ms ({int(1000/t)} FPS)')
             dpg.set_value("_log_resolution", f'{int(self.downscale * self.W)}x{int(self.downscale * self.H)}')
             dpg.set_value("_log_spp", self.spp)
+            dpg.set_value("_log_cam", str(self.cam.pose[:3, 3]))
             if os.environ.get('DEBUG', False): 
                 print(self.render_buffer.shape)
             dpg.set_value("_texture", self.render_buffer)
@@ -267,6 +268,8 @@ class NeRFGUI:
             with dpg.group(horizontal=True):
                 dpg.add_text("SPP: ")
                 dpg.add_text("1", tag="_log_spp")
+                dpg.add_text("Camera pose: ")
+                dpg.add_text(str(str(self.cam.pose[:3, 3])), tag="_log_cam")
 
             # train button
             if not self.opt.test:
@@ -335,7 +338,7 @@ class NeRFGUI:
                             print("Start dumping 3d map")
                             self.trainer.save_3dmap(resolution=self.map_res)
                             print("Finish dumping 3d map")
-                            dpg.set_value("_log_3dmap", "saved " + f'{self.trainer.name}_3dmap.npy')
+                            dpg.set_value("_log_3dmap", "saved " + f'{self.trainer.name}_3dmap.h5')
 
                         dpg.add_button(label="save_map", tag="_button_3dmap", callback=callback_save_map)
                         dpg.bind_item_theme("_button_3dmap", theme_button)

@@ -30,6 +30,7 @@ from torch_ema import ExponentialMovingAverage
 
 from packaging import version as pver
 import lpips
+import h5py
 
 from math import log10, sqrt
   
@@ -694,7 +695,7 @@ class Trainer(object):
         self.log(f"==> Finished saving mesh.")
     
     def save_3dmap(self, resolution=256):
-        save_path = os.path.join(self.workspace, f'{self.name}_3dmap.npy')
+        save_path = os.path.join(self.workspace, f'{self.name}_3dmap.h5')
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
         def query_func(pts):
@@ -705,7 +706,12 @@ class Trainer(object):
             return density_outputs['sigma'], sem_out
         
         density_out, sem_out = extract_fields_sem(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, query_func=query_func)
-        np.save(save_path, {"density": density_out, "sem": sem_out})
+        
+        with h5py.File(save_path, "w") as f:
+            f.create_dataset("density", data=density_out)
+            f.create_dataset("sem", data=sem_out)
+
+        # np.save(save_path, {"density": density_out, "sem": sem_out})
 
     ### ------------------------------
 
@@ -830,8 +836,8 @@ class Trainer(object):
             
             tot_loss = loss_dict['loss_rgb'].clone()
             # NOTE: loss merge
-            if loss_dict['loss_sem'] is not None:
-                tot_loss += loss_dict['loss_sem']
+            if (loss_dict['loss_sem'] is not None) and (self.global_step > self.opt.warmup_iter):
+                tot_loss += 4e-2 * loss_dict['loss_sem']
                 
             # if loss_dict['loss_dist'] is not None:
             #     tot_loss += loss_dict['loss_dist']
