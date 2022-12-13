@@ -211,7 +211,8 @@ class _march_rays_train(Function):
             step_counter = torch.zeros(2, dtype=torch.int32, device=rays_o.device) # point counter, ray counter
         
         if perturb:
-            noises = torch.rand(N, dtype=rays_o.dtype, device=rays_o.device)
+            # noises = torch.rand(N, dtype=rays_o.dtype, device=rays_o.device)
+            noises = torch.randn(N, dtype=rays_o.dtype, device=rays_o.device) # semantic nerf use gaussian loss
         else:
             noises = torch.zeros(N, dtype=rays_o.dtype, device=rays_o.device)
         

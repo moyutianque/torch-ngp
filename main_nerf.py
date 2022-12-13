@@ -71,7 +71,8 @@ if __name__ == '__main__':
     parser.add_argument('--ty', type=float, default=2)
     parser.add_argument('--tz', type=float, default=2)
 
-    parser.add_argument('--save_iter', type=int, default=100)
+    parser.add_argument('--save_iter', type=int, default=10000)
+    parser.add_argument('--warmup_iter', type=int, default=10000)
     parser.add_argument('--distortion_loss', action='store_true', help="distortion loss of mip nerf 360")
     parser.add_argument('--depth_reg', action='store_true', help="depth regularization loss of regnerf")
     parser.add_argument('--sem_mode', choices=['label_rgb', 'ins_rgb', 'label_id', 'ins_id'], default='ins_rgb', type=str)

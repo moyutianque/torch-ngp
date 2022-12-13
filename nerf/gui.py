@@ -6,52 +6,7 @@ from scipy.spatial.transform import Rotation as R
 
 from .utils import *
 from PIL import Image
-d3_40_colors_rgb: np.ndarray = np.array(
-    [
-        [1, 1, 1],
-        [31, 119, 180],
-        [174, 199, 232],
-        [255, 127, 14],
-        [255, 187, 120],
-        [44, 160, 44],
-        [152, 223, 138],
-        [214, 39, 40],
-        [255, 152, 150],
-        [148, 103, 189],
-        [197, 176, 213],
-        [140, 86, 75],
-        [196, 156, 148],
-        [227, 119, 194],
-        [247, 182, 210],
-        [127, 127, 127],
-        [199, 199, 199],
-        [188, 189, 34],
-        [219, 219, 141],
-        [23, 190, 207],
-        [158, 218, 229],
-        [57, 59, 121],
-        [82, 84, 163],
-        [107, 110, 207],
-        [156, 158, 222],
-        [99, 121, 57],
-        [140, 162, 82],
-        [181, 207, 107],
-        [206, 219, 156],
-        [140, 109, 49],
-        [189, 158, 57],
-        [231, 186, 82],
-        [231, 203, 148],
-        [132, 60, 57],
-        [173, 73, 74],
-        [214, 97, 107],
-        [231, 150, 156],
-        [123, 65, 115],
-        [165, 81, 148],
-        [206, 109, 189],
-        [222, 158, 214],
-    ],
-    dtype=np.uint8,
-)
+from constants import d3_40_colors_rgb
 
 class OrbitCamera:
     def __init__(self, W, H, r=2, fovy=60):
@@ -132,6 +87,11 @@ class NeRFGUI:
         self.spp = 1 # sample per pixel
         self.mode = 'image' # choose from ['image', 'depth']
 
+        if 'rgb' in self.opt.sem_mode:
+            self.sem_map_type = 'rgb'
+        else:
+            self.sem_map_type = 'id'
+
         self.dynamic_resolution = True
         self.downscale = 1
         self.train_steps = 16
@@ -150,7 +110,7 @@ class NeRFGUI:
         starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         starter.record()
 
-        outputs = self.trainer.train_gui(self.train_loader, step=self.train_steps, val_data=self.val_data, iters=self.global_iter)
+        outputs = self.trainer.train_gui(self.train_loader, step=self.train_steps, val_data=self.val_data, iters=self.global_iter, sem_map_type=self.sem_map_type)
 
         ender.record()
         torch.cuda.synchronize()
@@ -318,25 +278,26 @@ class NeRFGUI:
                         dpg.add_text("", tag="_log_ckpt")
                     
                     # save mesh
-                    with dpg.group(horizontal=True):
-                        dpg.add_text("Marching Cubes: ")
+                    # with dpg.group(horizontal=True):
+                    #     dpg.add_text("Marching Cubes: ")
 
-                        def callback_mesh(sender, app_data):
-                            self.trainer.save_mesh(resolution=256, threshold=10)
-                            dpg.set_value("_log_mesh", "saved " + f'{self.trainer.name}_{self.trainer.epoch}.ply')
-                            self.trainer.epoch += 1 # use epoch to indicate different calls.
+                    #     def callback_mesh(sender, app_data):
+                    #         self.trainer.save_mesh(resolution=256, threshold=10)
+                    #         dpg.set_value("_log_mesh", "saved " + f'{self.trainer.name}_{self.trainer.epoch}.ply')
+                    #         self.trainer.epoch += 1 # use epoch to indicate different calls.
 
-                        dpg.add_button(label="mesh", tag="_button_mesh", callback=callback_mesh)
-                        dpg.bind_item_theme("_button_mesh", theme_button)
+                    #     dpg.add_button(label="mesh", tag="_button_mesh", callback=callback_mesh)
+                    #     dpg.bind_item_theme("_button_mesh", theme_button)
 
-                        dpg.add_text("", tag="_log_mesh")
-                    
+                    #     dpg.add_text("", tag="_log_mesh")
+
+                    # save voxel map
                     with dpg.group(horizontal=True):
                         dpg.add_text("voxelized map: ")
 
                         def callback_save_map(sender, app_data):
                             print("Start dumping 3d map")
-                            self.trainer.save_3dmap(resolution=self.map_res)
+                            self.trainer.save_3dmap(resolution=self.map_res, sem_map_type=self.sem_map_type)
                             print("Finish dumping 3d map")
                             dpg.set_value("_log_3dmap", "saved " + f'{self.trainer.name}_3dmap.h5')
 

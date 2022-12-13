@@ -31,7 +31,7 @@ from torch_ema import ExponentialMovingAverage
 from packaging import version as pver
 import lpips
 import h5py
-
+from constants import d3_40_colors_rgb
 from math import log10, sqrt
   
 def np_PSNR(original, compressed):
@@ -46,6 +46,11 @@ def np_PSNR(original, compressed):
     psnr = 20 * log10(max_pixel / sqrt(mse))
     return psnr
 
+def np_diff_sem(original, synthesis):
+    msk = original == synthesis
+    ratio_diff = np.mean(msk)
+    
+    return ratio_diff
 
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
@@ -203,14 +208,17 @@ def extract_fields(bound_min, bound_max, resolution, query_func, S=128):
                     u[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = val
     return u
 
-def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128):
+def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128, sem_map_type='id'):
 
     X = torch.linspace(bound_min[0], bound_max[0], resolution).split(S)
     Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(S)
     Z = torch.linspace(bound_min[2], bound_max[2], resolution).split(S)
 
     u_density = np.zeros([resolution, resolution, resolution], dtype=np.float32)
-    u_sem = np.zeros([resolution, resolution, resolution], dtype=np.float32)
+    if sem_map_type == 'rgb':
+        u_sem = np.zeros([resolution, resolution, resolution, 3], dtype=np.float32)
+    else:
+        u_sem = np.zeros([resolution, resolution, resolution], dtype=np.float32)
     with torch.no_grad():
         for xi, xs in enumerate(X):
             for yi, ys in enumerate(Y):
@@ -221,9 +229,13 @@ def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128):
                     val = density.reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
                     u_density[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = val
 
-                    sem_out = torch.argmax(sem_out, dim=-1)
-                    sem_val = sem_out.reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
-                    u_sem[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = sem_val
+                    if sem_map_type == 'rgb':
+                        sem_val = sem_out.reshape(len(xs), len(ys), len(zs), -1).detach().cpu().numpy() # [S, 1] --> [x, y, z]
+                        u_sem[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs), :] = sem_val
+                    else:
+                        sem_out = torch.argmax(sem_out, dim=-1)
+                        sem_val = sem_out.reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
+                        u_sem[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = sem_val
     return u_density, u_sem
 
 
@@ -694,7 +706,7 @@ class Trainer(object):
 
         self.log(f"==> Finished saving mesh.")
     
-    def save_3dmap(self, resolution=256):
+    def save_3dmap(self, resolution=256, sem_map_type='rgb'):
         save_path = os.path.join(self.workspace, f'{self.name}_3dmap.h5')
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
@@ -705,7 +717,7 @@ class Trainer(object):
                     sem_out = self.model.sem(pts.to(self.device), **density_outputs)
             return density_outputs['sigma'], sem_out
         
-        density_out, sem_out = extract_fields_sem(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, query_func=query_func)
+        density_out, sem_out = extract_fields_sem(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, query_func=query_func, sem_map_type=sem_map_type)
         
         with h5py.File(save_path, "w") as f:
             f.create_dataset("density", data=density_out)
@@ -799,7 +811,7 @@ class Trainer(object):
         self.log(f"==> Finished Test.")
     
     # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
-    def train_gui(self, train_loader, step=16, val_data=None, iters=0):
+    def train_gui(self, train_loader, step=16, val_data=None, iters=0, sem_map_type='rgb'):
 
         self.model.train()
 
@@ -866,6 +878,9 @@ class Trainer(object):
             
             if loss_dict['loss_ds'] is not None:
                 total_loss_ds += loss_dict['loss_sem'].detach()
+            
+            if self.global_step != 0 and (self.global_step % self.opt.save_iter == 0):
+                self.get_view_sythesis(val_data, train_loader._data.intrinsics, train_loader._data.test_len, self.global_step, sem_map_type)
 
         if self.ema is not None:
             self.ema.update()
@@ -887,47 +902,75 @@ class Trainer(object):
             'lr': self.optimizer.param_groups[0]['lr'],
         }
 
-        # if val_data is not None and iters%self.save_iter == 0:
-        #     val_results = []
-        #     save_path = os.path.join(self.workspace, 'vis_eval')
-        #     os.makedirs(save_path, exist_ok=True)
-        #     psnr_list = []
-        #     psnr_list_oldview = []
-        #     for j, (p, im, im_sem) in enumerate(zip(*val_data)):
-        #         test_output = self.test_gui(
-        #                 p, train_loader._data.intrinsics, 
-        #                 im.shape[1], im.shape[0], bg_color=torch.ones(3, dtype=torch.float32)
-        #             )
-
-        #         img_rgb = (im * 255).astype(np.uint8)
-        #         img_sem = (im_sem * 255).astype(np.uint8)
-        #         pred = (test_output['image'] * 255).astype(np.uint8)
-        #         pred_sem = (test_output['sem'] * 255).astype(np.uint8)
-        #         pred_depth = (test_output['depth'] * 255).astype(np.uint8)
-
-        #         prefix = ''
-        #         if len(val_data[0])-j <= train_loader._data.test_len:
-        #             prefix = 'newview'
-        #             psnr_list.append(np_PSNR(img_rgb, pred))
-        #         else:
-        #             psnr_list_oldview.append(np_PSNR(img_rgb, pred))
-
-        #         cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}gt.png'), cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
-        #         cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_sem_{prefix}gt.png'), cv2.cvtColor(img_sem, cv2.COLOR_RGB2BGR))
-        #         cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
-        #         cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_sem_{prefix}.png'), cv2.cvtColor(pred_sem, cv2.COLOR_RGB2BGR))
-        #         cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_depth_{prefix}.png'), pred_depth)
-        #         val_results.append(test_output)
-            
-        #     with open(os.path.join(save_path, 'psnr_records.txt'), 'a') as file:
-        #         file.write(f"PSNR results for iter {iters}\n")
-        #         file.write(' '.join(str(v) for v in psnr_list_oldview) + "\n")
-        #         file.write("Old view PSNR avg: "+ str(np.mean(psnr_list_oldview))+ "\n")
-        #         file.write(' '.join(str(v) for v in psnr_list) + "\n")
-        #         file.write("Novel view PSNR avg: "+ str(np.mean(psnr_list))+ "\n\n")
-        #     outputs.update({'val_data': val_results})
         return outputs
 
+    def get_view_sythesis(self, val_data, intrinsics, test_len, iters, sem_map_type='rgb'):
+        val_results = []
+        save_path = os.path.join(self.workspace, 'vis_eval')
+        os.makedirs(save_path, exist_ok=True)
+        psnr_list = []
+        psnr_list_oldview = []
+        sem_diff = []
+        sem_diff_old = []
+        for j, (p, im, im_sem) in enumerate(zip(*val_data)):
+            test_output = self.test_gui(
+                    p, intrinsics, 
+                    im.shape[1], im.shape[0], bg_color=torch.ones(3, dtype=torch.float32)
+                )
+
+            img_rgb = (im * 255).astype(np.uint8)
+            pred = (test_output['image'] * 255).astype(np.uint8)
+            pred_depth = (test_output['depth'] * 255).astype(np.uint8)
+
+            if sem_map_type == 'rgb':
+                img_sem = (im_sem * 255).astype(np.uint8)
+                pred_sem_raw = test_output['sem']
+                pred_sem = (pred_sem_raw * 255).astype(np.uint8)
+            else:
+                msk_zero = im_sem == 0
+                img_sem = d3_40_colors_rgb[im_sem % 40 + 1].astype(np.uint8)
+                img_sem[msk_zero] = 0
+
+                pred_sem_raw = np.argmax(test_output['sem'], axis=-1).astype(int)
+                msk_zero = pred_sem_raw == 0
+                pred_sem = d3_40_colors_rgb[pred_sem_raw % 40 + 1].astype(np.uint8)
+                pred_sem[msk_zero] = 0
+
+            prefix = ''
+            if len(val_data[0])-j <= test_len:
+                prefix = 'newview'
+                psnr_list.append(np_PSNR(img_rgb, pred))
+                if sem_map_type == 'rgb':
+                    sem_diff.append(np_PSNR(img_sem, pred_sem))
+                else:
+                    sem_diff.append(np_diff_sem(im_sem, pred_sem_raw))
+            else:
+                psnr_list_oldview.append(np_PSNR(img_rgb, pred))
+                if sem_map_type == 'rgb':
+                    sem_diff_old.append(np_PSNR(img_sem, pred_sem))
+                else:
+                    sem_diff_old.append(np_diff_sem(im_sem, pred_sem_raw))
+
+            cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}gt.png'), cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_sem_{prefix}gt.png'), cv2.cvtColor(img_sem, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_sem_{prefix}.png'), cv2.cvtColor(pred_sem, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_depth_{prefix}.png'), pred_depth)
+            val_results.append(test_output)
+        
+        with open(os.path.join(save_path, 'psnr_records.txt'), 'a') as file:
+            file.write(f"PSNR results for iter {iters}\n")
+            file.write("[" + ' '.join(str(v) for v in psnr_list_oldview) + "]" + "\n")
+            file.write("Old view PSNR avg: "+ str(np.mean(psnr_list_oldview)) + "]" + "\n")
+            file.write("[" + ' '.join(str(v) for v in psnr_list) + "\n")
+            file.write("Novel view PSNR avg: "+ str(np.mean(psnr_list))+ "\n\n")
+
+            file.write(f"Sem diff results for iter {iters}\n")
+            file.write("[" + ' '.join(str(v) for v in sem_diff_old) + "]" + "\n")
+            file.write("Old view sem diff avg: "+ str(np.mean(sem_diff_old))+ "\n")
+            file.write("[" + ' '.join(str(v) for v in sem_diff) + "]" + "\n")
+            file.write("Novel view sem diff avg: "+ str(np.mean(sem_diff))+ "\n\n")
+            file.write("--------------------------------- \n\n")
     
     # [GUI] test on a single image
     def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1, downscale=1):
