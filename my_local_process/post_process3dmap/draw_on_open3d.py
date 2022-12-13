@@ -6,7 +6,8 @@ import matplotlib.pyplot as plt
 import h5py
 import torch
 from tqdm import tqdm
-from utils import merge_volume, split_volume, zero_pads, zero_unpads
+from utils import merge_volume, split_volume, zero_pads, zero_unpads, entropy_filter
+import os
 
 def process_density(dm_np, downsample_scale, t1 = 5., t2 = 0.5):
     """ return which volumns are possibly occupied """
@@ -37,6 +38,9 @@ def process_sem(sm_np, downsample_scale, msk2, t3=0.5):
     torch.cuda.empty_cache()
 
     sm_split, sm_size = split_volume(sm2, voxel_size=downsample_scale)
+    del sm2
+    torch.cuda.empty_cache()
+
     sm_split = sm_split.view(-1, downsample_scale*downsample_scale*downsample_scale)
 
     sm_mode_out, _ = torch.mode(sm_split, dim=1)
@@ -57,12 +61,13 @@ def draw_map(m):
     sem_labels = np.unique(m)
 
     mapper = {l:i for i, l in enumerate(sorted(sem_labels))}
-
-    color_palette = plt.get_cmap('Spectral')(np.linspace(0, 1, len(mapper)))
-    np.random.shuffle(color_palette)
-
     m = np.vectorize(mapper.get)(m)
-    facecolors = color_palette[m]
+
+    if os.environ.get('DEBUG', False):
+        m[0:20, 20:40, 0:20] = 1 # debug coordinate
+
+    # TODO denoising high entropy part
+    msk_etr = entropy_filter(m, kernel_size=3, threshold=0.8)
 
     pcd = o3d.geometry.PointCloud()
     xx,yy,zz =np.meshgrid(np.arange(m.shape[0]), np.arange(m.shape[1]), np.arange(m.shape[2]), indexing='ij')
@@ -70,17 +75,27 @@ def draw_map(m):
     pcd_np = np.vstack((xx.ravel(), yy.ravel(), zz.ravel(), m.ravel())).T
 
     pcd_msk = pcd_np[:,3]!=0
+    pcd_msk = pcd_msk & msk_etr
     pcd_np = pcd_np[pcd_msk]
-    facecolors = np.reshape(facecolors, (-1, 4))[pcd_msk]
-
     pcd.points = o3d.utility.Vector3dVector(pcd_np[:,:3])
-    pcd.colors = o3d.utility.Vector3dVector(facecolors[:,:3])
 
-    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=2)
-    o3d.visualization.draw_geometries([voxel_grid])
+    color_palette = plt.get_cmap('Spectral')(np.linspace(0, 1, len(mapper)))
 
-    # o3d.io.write_point_cloud("./sem_map.ply", pcd)
-    # o3d.io.write_voxel_grid("./sem_map.ply", voxel_grid)
+    while True:
+        np.random.shuffle(color_palette)
+        facecolors = color_palette[m]
+        facecolors = np.reshape(facecolors, (-1, 4))[pcd_msk]
+        pcd.colors = o3d.utility.Vector3dVector(facecolors[:,:3])
+
+        voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=1)
+        o3d.visualization.draw_geometries([voxel_grid], width=700, height=700)
+
+        # o3d.io.write_point_cloud("./sem_map.ply", pcd)    
+        in_key = input()
+        if in_key.strip() == 'q':
+            break
+    
+    o3d.io.write_voxel_grid("./sem_map.ply", voxel_grid)
 
 def load_map(map_path):
     with h5py.File(map_path, "r") as f:
@@ -116,6 +131,25 @@ if __name__ == '__main__':
     dm = filter_map(dm, opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz)
     sm = filter_map(sm, opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz)
 
+    if os.environ.get('DEBUG', False):
+        dm_coord = [0, 80, 0]
+        step = 5
+
+        test_chunck = dm[
+            dm_coord[0]: dm_coord[0]+step, 
+            dm_coord[1]: dm_coord[1]+step, 
+            dm_coord[2]: dm_coord[2]+step
+        ]
+        test_chunck_sem = sm[
+            dm_coord[0]: dm_coord[0]+step, 
+            dm_coord[1]: dm_coord[1]+step, 
+            dm_coord[2]: dm_coord[2]+step
+        ]
+        test_chunck = test_chunck.astype(int)
+        import ipdb;ipdb.set_trace() # breakpoint 129
+
+        print()
+
     # x_range = np.log(np.amax(dm))
     # y = np.zeros((int(x_range)+1))
     # for item in tqdm(np.random.choice(dm.flatten(), size=int(len(dm.flatten())/10))):
@@ -125,12 +159,11 @@ if __name__ == '__main__':
     # plt.bar(np.arange(x_range), y)
     # plt.show()
     # import ipdb;ipdb.set_trace() # breakpoint 102
-    
 
     # mask = dm > opt.d_thresh
     # sm[~mask] = 0
     with torch.no_grad():
         d_msk = process_density(dm, downsample_scale=opt.downsample_scale, t1=opt.t1, t2=opt.t2)
         sm_out = process_sem(sm, downsample_scale=opt.downsample_scale, msk2=d_msk, t3=opt.t3)
-    sm_out = sm_out.cpu().numpy()
+        sm_out = sm_out.cpu().numpy()
     draw_map(sm_out)
