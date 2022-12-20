@@ -96,11 +96,16 @@ class NeRFNetwork(NeRFRenderer):
         )
 
         self.sem_out_dim = sem_out_dim
+
+        # self.relu = nn.ReLU()
+        self.softplus = nn.Softplus()
     
     def sem_activation(self, x):
         # return torch.nn.functional.softmax(x, dim=-1)
         # return torch.sigmoid(x)
-        return x
+        # return x
+        return self.softplus(x)
+        # return self.relu(x)
        
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
@@ -111,7 +116,7 @@ class NeRFNetwork(NeRFRenderer):
         x = self.encoder(x)
         h = self.sigma_net(x)
 
-        #sigma = F.relu(h[..., 0])
+        # sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
@@ -141,7 +146,7 @@ class NeRFNetwork(NeRFRenderer):
         x = self.encoder(x)
         h = self.sigma_net(x)
 
-        #sigma = F.relu(h[..., 0])
+        # sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
         geo_feat = h[..., 1:]
 
@@ -216,6 +221,7 @@ class NeRFNetwork(NeRFRenderer):
             {'params': self.sigma_net.parameters(), 'lr': lr},
             {'params': self.encoder_dir.parameters(), 'lr': lr},
             {'params': self.color_net.parameters(), 'lr': lr}, 
+            {'params': self.sem_net.parameters(), 'lr': lr},  # NOTE zehao @ Dec 13, forget to add previously
         ]
         if self.bg_radius > 0:
             params.append({'params': self.encoder_bg.parameters(), 'lr': lr})

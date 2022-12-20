@@ -73,9 +73,12 @@ if __name__ == '__main__':
 
     parser.add_argument('--save_iter', type=int, default=10000)
     parser.add_argument('--warmup_iter', type=int, default=10000)
+    parser.add_argument('--dist_start', type=int, default=15000)
     parser.add_argument('--distortion_loss', action='store_true', help="distortion loss of mip nerf 360")
     parser.add_argument('--depth_reg', action='store_true', help="depth regularization loss of regnerf")
     parser.add_argument('--sem_mode', choices=['label_rgb', 'ins_rgb', 'label_id', 'ins_id'], default='ins_rgb', type=str)
+    parser.add_argument('--split_sem_code', action='store_true', help="")
+    parser.add_argument('--sigma_dropout', type=int, default=0, help="sigma dropout")
 
     opt = parser.parse_args()
 
@@ -101,7 +104,10 @@ if __name__ == '__main__':
             if 'rgb' in opt.sem_mode:
                 from nerf_sem.network_tcnn import NeRFNetwork
             else:
-                from nerf_sem.network_tcnn_insid import NeRFNetwork
+                if opt.split_sem_code:
+                    from nerf_sem.network_tcnn_insid_split_semcode import NeRFNetwork
+                else:
+                    from nerf_sem.network_tcnn_insid import NeRFNetwork
                
         else:
             from nerf.network_tcnn import NeRFNetwork
@@ -168,7 +174,7 @@ if __name__ == '__main__':
             density_thresh=opt.density_thresh,
             bg_radius=opt.bg_radius,
             aabb_bounds=[opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz],
-            sem_out_dim=train_loader._data.num_labels
+            sem_out_dim=train_loader._data.num_labels,
         )
         
         print(model)

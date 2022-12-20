@@ -116,15 +116,10 @@ class NeRFDataset:
         # load nerf-compatible format data.
         with open(os.path.join(self.root_path, 'transforms.json'), 'r') as f:
             transform = json.load(f)
-        
-        # NOTE only for replica purpose
-        #test_index = [22, 114, 158, 159, 169] # scene 17DRP5sb8fy
-        test_index = [17, 18, 19, 20, 65, 87, 124, 145] # replica apartment 2
-        verify_index = [60, 62, 81, 82, 116, 117, 133, 134]
 
         # replica apartment 2 dining room
-        test_index = []
-        verify_index = []
+        test_index = [210, 248]
+        verify_index = [51, 67, 100, 192, 224, 237]
         self.test_len = len(test_index)
 
         self.target_labels = set() # only for classification sem model

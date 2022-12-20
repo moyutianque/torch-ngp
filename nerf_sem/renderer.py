@@ -57,6 +57,15 @@ def plot_pointcloud(pc, color=None):
     # sphere
     sphere = trimesh.creation.icosphere(radius=1)
     trimesh.Scene([pc, axes, sphere]).show()
+    
+def dist_loss(w, t):
+    # transfered from jax code of mip nerf 360
+    ut = (t[..., 1:] + t[..., :-1]) / 2
+    dut = torch.abs(ut[..., :, None] - ut[..., None, :])
+    loss_inter = torch.sum(w * torch.sum(w[..., None, :] * dut, dim=-1), dim=-1)
+    loss_intra = torch.sum(w**2 * (t[..., 1:] - t[..., :-1]), dim=-1) / 3
+
+    return loss_inter + loss_intra
 
 
 class NeRFRenderer(nn.Module):
@@ -94,6 +103,7 @@ class NeRFRenderer(nn.Module):
         if cuda_ray:
             # density grid
             density_grid = torch.zeros([self.cascade, self.grid_size ** 3]) # [CAS, H * H * H]
+            density_grid2 = torch.zeros([self.cascade, self.grid_size ** 3]) # [CAS, H * H * H]
             density_bitfield = torch.zeros(self.cascade * self.grid_size ** 3 // 8, dtype=torch.uint8) # [CAS * H * H * H // 8]
             self.register_buffer('density_grid', density_grid)
             self.register_buffer('density_bitfield', density_bitfield)
@@ -217,16 +227,15 @@ class NeRFRenderer(nn.Module):
         alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+t+1]
         weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T+t]
         
-        normalized_z_vals = nn.functional.normalize(z_vals, dim=1)
-        deltas2 = normalized_z_vals[..., 1:] - normalized_z_vals[..., :-1] # [N, T+t-1]
-        deltas2 = torch.cat([deltas2, sample_dist * torch.ones_like(deltas2[..., :1])], dim=-1)
-        deltas2 = 1 - torch.exp(-deltas2 * self.density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T+t]
-        weights2 = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T+t]
+        # normalized_z_vals = nn.functional.normalize(z_vals, dim=1)
+        # deltas2 = normalized_z_vals[..., 1:] - normalized_z_vals[..., :-1] # [N, T+t-1]
+        # deltas2 = torch.cat([deltas2, sample_dist * torch.ones_like(deltas2[..., :1])], dim=-1)
+        # deltas2 = 1 - torch.exp(-deltas2 * self.density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T+t]
+        # weights2 = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T+t]
         
         # NOTE: for distortion loss
-        z_vals_mid = (normalized_z_vals[..., :-1] + 0.5 * deltas2[..., :-1]) # [N, T+t-1]
-        # z_vals_mid = nn.functional.normalize(z_vals_mid, dim=1)
-        interval = 1/z_vals_mid.shape[1]
+        # z_vals_mid = (normalized_z_vals[..., :-1] + 0.5 * deltas2[..., :-1]) # [N, T+t-1]
+        # interval = 1/z_vals_mid.shape[1]
 
         dirs = rays_d.view(-1, 1, 3).expand_as(xyzs)
         for k, v in density_outputs.items():
@@ -235,9 +244,6 @@ class NeRFRenderer(nn.Module):
         mask = weights > 1e-4 # hard coded
         rgbs = self.color(xyzs.reshape(-1, 3), dirs.reshape(-1, 3), mask=mask.reshape(-1), **density_outputs)
         rgbs = rgbs.view(N, -1, 3) # [N, T+t, 3]
-
-        rgbs_sem = self.sem(xyzs.reshape(-1, 3), mask=mask.reshape(-1), **density_outputs)
-        rgbs_sem = rgbs_sem.view(N, -1, self.sem_out_dim) # [N, T+t, self.sem_out_dim]
 
         #print(xyzs.shape, 'valid_rgb:', mask.sum().item())
         # dist_loss = 0.05* eff_distloss(weights2[:, 1:], z_vals_mid, interval) # 360 distortion loss
@@ -254,6 +260,30 @@ class NeRFRenderer(nn.Module):
         image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 100], in [0, 1]
 
         # calculate sem
+        mask_sem = mask
+        # NOTE zehao: this is a temporal implimentation of depth clamp for sem rendering
+        # if self.training and (self.global_step > self.warmup_iter):
+        #     print(depth)
+        #     tolerance = 0.2
+        #     with torch.no_grad():
+        #         index = (torch.clamp(depth.detach()+ tolerance, nears.squeeze(), fars.squeeze()) /sample_dist.squeeze()).long()
+        #         mask_sem = z_vals <= z_vals[index]
+        rgbs_sem = self.sem(xyzs.reshape(-1, 3), mask=mask_sem.reshape(-1), **density_outputs)
+        rgbs_sem = rgbs_sem.view(N, -1, self.sem_out_dim) # [N, T+t, self.sem_out_dim]
+
+        # NOTE: distortion loss for each semantic channel (instance level) not include normalization
+        if self.training:
+            z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1]) # [N, T-1]
+            interval = 1/z_vals_mid.shape[1] * (2*self.bound)
+            dist_loss = 0
+            distloss_w = 0.001
+            for c_idx in range(rgbs_sem.shape[-1]):
+                if c_idx == 0:
+                    continue
+                w =  rgbs_sem[:,:-1, c_idx] / (rgbs_sem[:,:-1, c_idx].sum(-1, keepdim=True).detach() + 1e-7)
+                # w =  rgbs_sem[:,:-1, c_idx]
+                dist_loss += distloss_w * eff_distloss(w, z_vals_mid, interval) # 360 distortion loss
+            
         image_sem = torch.sum(weights.unsqueeze(-1) * rgbs_sem, dim=-2) # [N, self.sem_out_dim], in [0, 1]
 
         # mix background color
@@ -349,10 +379,27 @@ class NeRFRenderer(nn.Module):
                 # image = torch.stack(images, axis=0) # [K, B, N, 3]
                 raise NotImplementedError()
             else:
-
                 weights_sum, depth, image = raymarching.composite_rays_train(sigmas, rgbs, deltas, rays, T_thresh)
-                weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas, sems, deltas, rays, T_thresh)
                 image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+                
+                # NOTE zehao @ Dec 14 change ray fars by depth
+                # tolerance = 0.5
+                # nears2 = nears.clone().detach()
+                # fars2 = depth.clone().detach() + tolerance
+                # idx_near = fars2 < nears2
+                # fars2[idx_near] = nears2[idx_near] + tolerance
+
+                # xyzs2, dirs2, deltas2, rays2 = raymarching.march_rays_train(
+                #     rays_o.clone().detach(), rays_d.clone().detach(), self.bound, self.density_bitfield2, self.cascade, self.grid_size, 
+                #     nears2, fars2, counter, self.mean_count, perturb, 128, force_all_rays, dt_gamma, max_steps
+                # )
+                # # import ipdb;ipdb.set_trace() # breakpoint 368
+                # sigmas2, _, sems2 = self(xyzs2, dirs2)
+                # sigmas2 = self.density_scale * sigmas2
+                # weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas2, sems2, deltas2, rays2, T_thresh)
+                # image_sem = image_sem + (1 - weights_sum_sem).unsqueeze(-1) * sem_bg_color
+
+                weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas, sems, deltas, rays, T_thresh)
                 image_sem = image_sem + (1 - weights_sum_sem).unsqueeze(-1) * sem_bg_color
 
                 depth = torch.clamp(depth - nears, min=0) / (fars - nears)
@@ -633,6 +680,9 @@ class NeRFRenderer(nn.Module):
 
 
     def render(self, rays_o, rays_d, staged=False, max_ray_batch=4096, **kwargs):
+        self.warmup_iter = kwargs['warmup_iter']
+        self.global_step = kwargs['global_step']
+
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # return: pred_rgb: [B, N, 3]
 

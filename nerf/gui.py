@@ -122,7 +122,7 @@ class NeRFGUI:
 
         dpg.set_value("_log_train_time", f'{t:.4f}ms ({int(1000/t)} FPS)')
         if "l_sem" in outputs.keys():
-            dpg.set_value("_log_train_log", f'step = {self.step: 5d} (+{self.train_steps: 2d}), lrgb = {outputs["l_rgb"]:.4f}, lsem = {outputs["l_sem"]:.4f}, lds = {outputs["l_ds"]:.4f}, lr = {outputs["lr"]:.5f}')
+            dpg.set_value("_log_train_log", f'step = {self.step: 5d} (+{self.train_steps: 2d}), lrgb = {outputs["l_rgb"]:.4f}, lsem = {outputs["l_sem"]:.4f}, l_dist = {outputs["l_dist"]:.4f}, lr = {outputs["lr"]:.5f}')
         else:
             dpg.set_value("_log_train_log", f'step = {self.step: 5d} (+{self.train_steps: 2d}), loss = {outputs["loss"]:.4f}, lr = {outputs["lr"]:.5f}')
 

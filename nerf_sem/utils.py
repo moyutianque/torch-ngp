@@ -147,7 +147,7 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
 
     directions = torch.stack((xs, ys, zs), dim=-1)
     directions = directions / torch.norm(directions, dim=-1, keepdim=True)
-    rays_d = directions @ poses[:, :3, :3].transpose(-1, -2) # (B, N, 3) # NOTE zehao cam coord to world coord
+    rays_d = directions @ poses[:, :3, :3].transpose(-1, -2) # (B, N, 3) # NOTE cam coord to world coord
 
     rays_o = poses[..., :3, 3] # [B, 3]
     rays_o = rays_o[..., None, :].expand_as(rays_d) # [B, N, 3]
@@ -503,7 +503,7 @@ class Trainer(object):
             H, W = data['H'], data['W']
 
             # currently fix white bg, MUST force all rays!
-            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, force_all_rays=True, **vars(self.opt))
+            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, force_all_rays=True, global_step=self.global_step,**vars(self.opt))
             pred_rgb = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
 
             pred_sem = outputs['image_sem'].reshape(B, H, W, self.model.sem_out_dim).permute(0, 3, 1, 2).contiguous()
@@ -527,8 +527,7 @@ class Trainer(object):
             bg_color = 1
         # train with random background color if not using a bg model and has alpha channel.
         else:
-            #bg_color = torch.ones(3, device=self.device) # [3], fixed white background
-            # bg_color = torch.zeros(3, device=self.device) # [3], fixed black background
+            # bg_color = torch.ones(3, device=self.device) # [3], fixed white background
             #bg_color = torch.rand(3, device=self.device) # [3], frame-wise random.
             bg_color = torch.rand_like(images[..., :3]) # [N, 3], pixel-wise random.
 
@@ -538,11 +537,11 @@ class Trainer(object):
             gt_rgb = images
 
 
-        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, global_step=self.global_step, **vars(self.opt))
         # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
         outputs_rd = None
         if 'rd_rays_o' in data:
-            outputs_rd = self.model.render(data['rd_rays_o'], data['rd_rays_d'], staged=False, bg_color=torch.rand(3, device=self.device), perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
+            outputs_rd = self.model.render(data['rd_rays_o'], data['rd_rays_d'], staged=False, bg_color=torch.rand(3, device=self.device), perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, gloabl_step=self.global_step, **vars(self.opt))
 
         pred_rgb = outputs['image']
         pred_sem = outputs['image_sem']
@@ -554,7 +553,8 @@ class Trainer(object):
         # mask = torch.all(gt_sem==0, dim=2, keepdim=True).squeeze(-1)
         if len(gt_sem.shape) == 2:
             gt_sem = gt_sem.view(-1).long()
-            loss_sem = self.criterion_sem(pred_sem.view(len(gt_sem), -1), gt_sem)
+            pred_sem = pred_sem.view(len(gt_sem), -1)
+            loss_sem = self.criterion_sem(pred_sem, gt_sem)
             # BCE
             # skip_idx = gt_sem != -100
             # onehot_gt = torch.nn.functional.one_hot(gt_sem[skip_idx], num_classes=pred_sem.shape[2]).float()
@@ -563,7 +563,7 @@ class Trainer(object):
             #     onehot_gt
             # )
         else:
-            loss_sem = self.criterion_sem(pred_sem.view(-1, pred_sem.shape[2]), gt_sem).mean(-1)
+            loss_sem = self.criterion_sem(pred_sem, gt_sem).mean(-1)
         # loss_sem = loss_sem[~mask] 
 
         loss_dist = None
@@ -656,7 +656,7 @@ class Trainer(object):
         else:
             gt_rgb = images
         
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, global_step=self.global_step,**vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
@@ -675,7 +675,7 @@ class Trainer(object):
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
 
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, global_step=self.global_step, **vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(-1, H, W, 3)
         pred_depth = outputs['depth'].reshape(-1, H, W)
@@ -818,6 +818,7 @@ class Trainer(object):
         total_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
         total_loss_sem = torch.tensor([0], dtype=torch.float32, device=self.device)
         total_loss_ds = torch.tensor([0], dtype=torch.float32, device=self.device)
+        total_loss_dist = torch.tensor([0], dtype=torch.float32, device=self.device)
         
         loader = iter(train_loader)
 
@@ -849,7 +850,10 @@ class Trainer(object):
             tot_loss = loss_dict['loss_rgb'].clone()
             # NOTE: loss merge
             if (loss_dict['loss_sem'] is not None) and (self.global_step > self.opt.warmup_iter):
-                tot_loss += 4e-2 * loss_dict['loss_sem']
+                sem_loss_w = 1. # semantic-nerf use 4e-2
+                tot_loss += sem_loss_w * loss_dict['loss_sem']
+                if (loss_dict['loss_dist'] is not None) and self.global_step > self.opt.dist_start:
+                    tot_loss += 1. * loss_dict['loss_dist']
                 
             # if loss_dict['loss_dist'] is not None:
             #     tot_loss += loss_dict['loss_dist']
@@ -861,13 +865,24 @@ class Trainer(object):
             # l1_norm = sum(torch.norm(p,1) for p in self.model.parameters())
             # l1_lambda = 0.00001
             # tot_loss += l1_lambda * l1_norm
-
             self.scaler.scale(tot_loss).backward()
             # self.scaler.scale(loss_dict['loss_rgb']).backward() # NOTE only RGB loss
 
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
+
+            # if self.opt.sigma_dropout > 0 and (self.global_step > self.opt.warmup_iter):
+            #     self.optimizer.zero_grad()
+            #     sig_pts = torch.rand((self.opt.sigma_dropout, 3), device=self.device) * (self.model.aabb_infer[3:] - self.model.aabb_infer[:3])
+            #     sig_pts = sig_pts - self.model.aabb_infer[:3]
+            #     sig = self.model.density(sig_pts)['sigma']
+            #     sig_loss = self.criterion(sig, torch.zeros_like(sig)).mean() * 1e-1
+            #     self.scaler.scale(sig_loss).backward()
+            #     self.scaler.step(self.optimizer)
+            #     self.scaler.update()
+            #     print("[INFO] include sigma drop")
+
             
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
@@ -876,8 +891,11 @@ class Trainer(object):
             if loss_dict['loss_sem'] is not None:
                 total_loss_sem += loss_dict['loss_sem'].detach()
             
-            if loss_dict['loss_ds'] is not None:
-                total_loss_ds += loss_dict['loss_sem'].detach()
+            if loss_dict['loss_dist'] is not None:
+                total_loss_dist += loss_dict['loss_dist'].detach()
+            
+            # if loss_dict['loss_ds'] is not None:
+            #     total_loss_ds += loss_dict['loss_ds'].detach() # depth smooth (decrepted)
             
             if self.global_step != 0 and (self.global_step % self.opt.save_iter == 0):
                 self.get_view_sythesis(val_data, train_loader._data.intrinsics, train_loader._data.test_len, self.global_step, sem_map_type)
@@ -888,6 +906,7 @@ class Trainer(object):
         average_loss = total_loss.item() / step
         average_loss_sem = total_loss_sem.item() / step
         average_loss_ds = total_loss_ds.item() / step
+        average_loss_dist = total_loss_dist.item() / step
 
         if not self.scheduler_update_every_step:
             if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -898,7 +917,7 @@ class Trainer(object):
         outputs = {
             'l_rgb': average_loss,
             'l_sem': average_loss_sem,
-            'l_ds':average_loss_ds,
+            'l_dist':average_loss_dist,
             'lr': self.optimizer.param_groups[0]['lr'],
         }
 
@@ -971,7 +990,9 @@ class Trainer(object):
             file.write("[" + ' '.join(str(v) for v in sem_diff) + "]" + "\n")
             file.write("Novel view sem diff avg: "+ str(np.mean(sem_diff))+ "\n\n")
             file.write("--------------------------------- \n\n")
-    
+
+        self.model.train()
+
     # [GUI] test on a single image
     def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1, downscale=1):
         
