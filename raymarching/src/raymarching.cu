@@ -814,6 +814,8 @@ template <typename scalar_t>
 __global__ void kernel_composite_rays_train_backward(
     const scalar_t * __restrict__ grad_weights_sum,
     const scalar_t * __restrict__ grad_image,
+    const scalar_t * __restrict__ grad_depth,
+    const scalar_t * __restrict__ depth,
     const scalar_t * __restrict__ sigmas,
     const scalar_t * __restrict__ rgbs, 
     const scalar_t * __restrict__ deltas,
@@ -837,8 +839,10 @@ __global__ void kernel_composite_rays_train_backward(
 
     grad_weights_sum += index;
     grad_image += index * 3;
+    grad_depth += index;
     weights_sum += index;
     image += index * 3;
+    depth += index;
     sigmas += offset;
     rgbs += offset * 3;
     deltas += offset * 2;
@@ -849,8 +853,10 @@ __global__ void kernel_composite_rays_train_backward(
     uint32_t step = 0;
     
     scalar_t T = 1.0f;
-    const scalar_t r_final = image[0], g_final = image[1], b_final = image[2], ws_final = weights_sum[0];
-    scalar_t r = 0, g = 0, b = 0, ws = 0;
+    // const scalar_t r_final = image[0], g_final = image[1], b_final = image[2], ws_final = weights_sum[0];
+    // scalar_t r = 0, g = 0, b = 0, ws = 0;
+    const scalar_t r_final = image[0], g_final = image[1], b_final = image[2], ws_final = weights_sum[0], d_final = depth[0];
+    scalar_t r = 0, g = 0, b = 0, ws = 0, t = 0, d = 0;
 
     while (step < num_steps) {
         
@@ -861,6 +867,8 @@ __global__ void kernel_composite_rays_train_backward(
         g += weight * rgbs[1];
         b += weight * rgbs[2];
         ws += weight;
+        t += deltas[1]; // real delta
+        d += weight * t;
 
         T *= 1.0f - alpha;
         
@@ -875,7 +883,8 @@ __global__ void kernel_composite_rays_train_backward(
             grad_image[0] * (T * rgbs[0] - (r_final - r)) + 
             grad_image[1] * (T * rgbs[1] - (g_final - g)) + 
             grad_image[2] * (T * rgbs[2] - (b_final - b)) +
-            grad_weights_sum[0] * (1 - ws_final)
+            grad_depth[0] * (T * t - (d_final - d)) +
+            grad_weights_sum[0] * (T - (ws_final - ws))
         );
 
         //printf("[n=%d] num_steps=%d, T=%f, grad_sigmas=%f, r_final=%f, r=%f\n", n, step, T, grad_sigmas[0], r_final, r);
@@ -894,16 +903,15 @@ __global__ void kernel_composite_rays_train_backward(
 }
 
 
-void composite_rays_train_backward(const at::Tensor grad_weights_sum, const at::Tensor grad_image, const at::Tensor sigmas, const at::Tensor rgbs, const at::Tensor deltas, const at::Tensor rays, const at::Tensor weights_sum, const at::Tensor image, const uint32_t M, const uint32_t N, const float T_thresh, at::Tensor grad_sigmas, at::Tensor grad_rgbs) {
+void composite_rays_train_backward(const at::Tensor grad_weights_sum, const at::Tensor grad_image, const at::Tensor grad_depth, const at::Tensor depth, const at::Tensor sigmas, const at::Tensor rgbs, const at::Tensor deltas, const at::Tensor rays, const at::Tensor weights_sum, const at::Tensor image, const uint32_t M, const uint32_t N, const float T_thresh, at::Tensor grad_sigmas, at::Tensor grad_rgbs) {
 
     static constexpr uint32_t N_THREAD = 128;
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
     grad_image.scalar_type(), "composite_rays_train_backward", ([&] {
-        kernel_composite_rays_train_backward<<<div_round_up(N, N_THREAD), N_THREAD>>>(grad_weights_sum.data_ptr<scalar_t>(), grad_image.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), weights_sum.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), M, N, T_thresh, grad_sigmas.data_ptr<scalar_t>(), grad_rgbs.data_ptr<scalar_t>());
+        kernel_composite_rays_train_backward<<<div_round_up(N, N_THREAD), N_THREAD>>>(grad_weights_sum.data_ptr<scalar_t>(), grad_image.data_ptr<scalar_t>(), grad_depth.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), weights_sum.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), M, N, T_thresh, grad_sigmas.data_ptr<scalar_t>(), grad_rgbs.data_ptr<scalar_t>());
     }));
 }
-
 
 ////////////////////////////////////////////////////
 /////////////          infernce        /////////////

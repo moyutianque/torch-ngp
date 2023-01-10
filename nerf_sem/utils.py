@@ -33,7 +33,7 @@ import lpips
 import h5py
 from constants import d3_40_colors_rgb
 from math import log10, sqrt
-  
+
 def np_PSNR(original, compressed):
     if original.shape[2] == 4:
         original = original[:,:,:3]
@@ -208,13 +208,16 @@ def extract_fields(bound_min, bound_max, resolution, query_func, S=128):
                     u[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = val
     return u
 
-def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128, sem_map_type='id'):
+def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128, sem_map_type='id', return_pts=False):
 
     X = torch.linspace(bound_min[0], bound_max[0], resolution).split(S)
     Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(S)
     Z = torch.linspace(bound_min[2], bound_max[2], resolution).split(S)
 
     u_density = np.zeros([resolution, resolution, resolution], dtype=np.float32)
+    if return_pts:
+        u_pts = np.zeros([resolution, resolution, resolution, 3], dtype=np.float32)
+
     if sem_map_type == 'rgb':
         u_sem = np.zeros([resolution, resolution, resolution, 3], dtype=np.float32)
     else:
@@ -227,6 +230,10 @@ def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128, sem_
                     pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [S, 3]
                     density, sem_out = query_func(pts)
                     val = density.reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
+                    if return_pts:
+                        pt_reshape = pts.reshape(len(xs), len(ys), len(zs), 3).detach().cpu().numpy() # [S, 3] --> [x, y, z, 3]
+                        u_pts[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs), :] = pt_reshape
+
                     u_density[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = val
 
                     if sem_map_type == 'rgb':
@@ -236,6 +243,8 @@ def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128, sem_
                         sem_out = torch.argmax(sem_out, dim=-1)
                         sem_val = sem_out.reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
                         u_sem[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = sem_val
+    if return_pts:
+        return u_density, u_sem, u_pts
     return u_density, u_sem
 
 
@@ -517,6 +526,8 @@ class Trainer(object):
         
         images = data['images'] # [B, N, 3/4]
         gt_sem = data['images_sem']
+        if self.opt.depth_sup:
+            gt_depth = data['images_depth']
 
         B, N, C = images.shape
 
@@ -545,6 +556,13 @@ class Trainer(object):
 
         pred_rgb = outputs['image']
         pred_sem = outputs['image_sem']
+        if self.opt.depth_sup:
+            pred_depth = outputs['depth']
+        
+        # NOTE: MSE depth loss
+        loss_depth = None
+        if self.opt.depth_sup:
+            loss_depth = self.criterion(pred_depth, gt_depth).mean()
 
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
@@ -632,6 +650,7 @@ class Trainer(object):
         # loss = loss + loss_ws.mean()
         loss = {
             'loss_rgb': loss_rgb,
+            "loss_depth": loss_depth,
             'loss_sem': loss_sem,
             'loss_dist': loss_dist,
             'loss_ds': loss_ds
@@ -705,11 +724,8 @@ class Trainer(object):
         mesh.export(save_path)
 
         self.log(f"==> Finished saving mesh.")
-    
-    def save_3dmap(self, resolution=256, sem_map_type='rgb'):
-        save_path = os.path.join(self.workspace, f'{self.name}_3dmap.h5')
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        
+
+    def get_3dmap(self, resolution, sem_map_type, return_pts=False):
         def query_func(pts):
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=self.fp16):
@@ -717,13 +733,17 @@ class Trainer(object):
                     sem_out = self.model.sem(pts.to(self.device), **density_outputs)
             return density_outputs['sigma'], sem_out
         
-        density_out, sem_out = extract_fields_sem(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, query_func=query_func, sem_map_type=sem_map_type)
+        return extract_fields_sem(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, query_func=query_func, sem_map_type=sem_map_type, return_pts=return_pts)
+
+    def save_3dmap(self, resolution=256, sem_map_type='rgb'):
+        save_path = os.path.join(self.workspace, f'{self.name}_3dmap.h5')
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
+        density_out, sem_out = self.get_3dmap(resolution, sem_map_type, return_pts=False)
+
         with h5py.File(save_path, "w") as f:
             f.create_dataset("density", data=density_out)
             f.create_dataset("sem", data=sem_out)
-
-        # np.save(save_path, {"density": density_out, "sem": sem_out})
 
     ### ------------------------------
 
@@ -848,18 +868,48 @@ class Trainer(object):
                 preds, truths, loss_dict = self.train_step(data)
             
             tot_loss = loss_dict['loss_rgb'].clone()
+            # tot_loss = 0
+        
             # NOTE: loss merge
             if (loss_dict['loss_sem'] is not None) and (self.global_step > self.opt.warmup_iter):
                 sem_loss_w = 1. # semantic-nerf use 4e-2
                 tot_loss += sem_loss_w * loss_dict['loss_sem']
                 if (loss_dict['loss_dist'] is not None) and self.global_step > self.opt.dist_start:
                     tot_loss += 1. * loss_dict['loss_dist']
+
+            if loss_dict['loss_depth'] is not None:
+                tot_loss += loss_dict['loss_depth']
                 
             # if loss_dict['loss_dist'] is not None:
             #     tot_loss += loss_dict['loss_dist']
             
             # if loss_dict['loss_ds'] is not None:
             #     tot_loss += loss_dict['loss_ds'] 
+            if self.opt.post_3dmap_loss:
+                if (not hasattr(self, 'pts_empty')) or (self.global_step % self.opt.density_sample_size == 1):
+                    from nerf_sem.semmap_post import map_filtering
+                    dm, sm, pts = self.get_3dmap(resolution=256, sem_map_type='id', return_pts=True)
+                    dm_out = map_filtering(dm, sm)
+                    pts = pts.reshape((-1,3))
+                    dm_out= dm_out.flatten()
+                    empty_idx = dm_out == 0
+                    self.pts_empty = pts[empty_idx]
+
+                sample_idxs = random.sample([i for i in range(len(self.pts_empty))], min(1024, len(self.pts_empty)))
+                pts_selected = self.pts_empty[sample_idxs]
+                pts_selected = torch.from_numpy(pts_selected).to(self.device)
+
+                # sample pts for mark
+                density_outputs = self.model.density(pts_selected)
+                # NOTE: with sem empty loss
+                # sem_out = self.model.sem(pts_selected, **density_outputs) # float16 not support crossentropy
+                # tot_loss += 0.001 * self.criterion_sem(sem_out.to(torch.float32), torch.zeros_like(density_outputs['sigma']).to(torch.float32))
+
+                raw_loss = self.criterion(density_outputs['sigma'], torch.zeros_like(density_outputs['sigma']))
+                filtered_idx = ~torch.isinf(raw_loss)
+                empty_density_loss = 0.0001 * raw_loss[filtered_idx].mean()
+                print(empty_density_loss.item(), torch.sum(filtered_idx))
+                tot_loss += empty_density_loss
 
             # NOTE: add regularization
             # l1_norm = sum(torch.norm(p,1) for p in self.model.parameters())
@@ -867,7 +917,6 @@ class Trainer(object):
             # tot_loss += l1_lambda * l1_norm
             self.scaler.scale(tot_loss).backward()
             # self.scaler.scale(loss_dict['loss_rgb']).backward() # NOTE only RGB loss
-
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -896,7 +945,7 @@ class Trainer(object):
             
             # if loss_dict['loss_ds'] is not None:
             #     total_loss_ds += loss_dict['loss_ds'].detach() # depth smooth (decrepted)
-            
+
             if self.global_step != 0 and (self.global_step % self.opt.save_iter == 0):
                 self.get_view_sythesis(val_data, train_loader._data.intrinsics, train_loader._data.test_len, self.global_step, sem_map_type)
 
@@ -1335,6 +1384,7 @@ class Trainer(object):
         self.stats = checkpoint_dict['stats']
         self.epoch = checkpoint_dict['epoch']
         self.global_step = checkpoint_dict['global_step']
+        self.global_step = 0
         self.log(f"[INFO] load at epoch {self.epoch}, global step {self.global_step}")
         
         if self.optimizer and 'optimizer' in checkpoint_dict:

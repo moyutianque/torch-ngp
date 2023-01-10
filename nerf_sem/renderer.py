@@ -253,8 +253,13 @@ class NeRFRenderer(nn.Module):
         weights_sum = weights.sum(dim=-1) # [N]
         
         # calculate depth 
-        ori_z_vals = ((z_vals - nears) / (fars - nears)).clamp(0, 1)
-        depth = torch.sum(weights * ori_z_vals, dim=-1)
+        if not self.training:
+            ori_z_vals = ((z_vals - nears) / (fars - nears)).clamp(0, 1)
+            depth = torch.sum(weights * ori_z_vals, dim=-1)
+        else:
+            # NOTE: use exact depth val
+            depth = torch.sum(weights * z_vals, dim=-1)
+
 
         # calculate color
         image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 100], in [0, 1]
@@ -402,8 +407,9 @@ class NeRFRenderer(nn.Module):
                 weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas, sems, deltas, rays, T_thresh)
                 image_sem = image_sem + (1 - weights_sum_sem).unsqueeze(-1) * sem_bg_color
 
-                depth = torch.clamp(depth - nears, min=0) / (fars - nears)
+                depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
                 image = image.view(*prefix, 3)
+                depth_normalized = depth_normalized.view(*prefix)
                 depth = depth.view(*prefix)
                 image_sem = image_sem.view(*prefix, self.sem_out_dim)
             
@@ -463,6 +469,8 @@ class NeRFRenderer(nn.Module):
                 step += n_step
 
             image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+
+            # NOTE: check wether need to standardize will supervision on depth
             depth = torch.clamp(depth - nears, min=0) / (fars - nears)
             image = image.view(*prefix, 3)
             depth = depth.view(*prefix)

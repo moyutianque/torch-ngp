@@ -27,7 +27,7 @@ h=968
 
 ## Replica
 fl_x=320
-fl_y=320
+fl_y=240
 cx=319.5
 cy=239.5
 w=640
@@ -35,7 +35,7 @@ h=480
 
 ## Replica
 fl_x=400
-fl_y=400
+fl_y=300
 cx=399.5
 cy=299.5
 w=800
@@ -151,12 +151,23 @@ def post_processing(up=None):
         avglen += np.linalg.norm(f["transform_matrix"][0:3,3])
     avglen /= nframes
     print("avg camera distance from origin", avglen)
+    p1, p2 = np.copy(out["frames"][0]["transform_matrix"][0:3,3]), np.copy(out["frames"][200]["transform_matrix"][0:3,3])
     for f in out["frames"]:
         f["transform_matrix"][0:3,3] *= camera_scale_factor / avglen # scale to "nerf sized"
+    p11, p21 = out["frames"][0]["transform_matrix"][0:3,3], out["frames"][200]["transform_matrix"][0:3,3]
+    
+    # Verify scaling factor
+    from scipy.spatial.distance import euclidean
+    d1 = euclidean(p1,p2)
+    d2 = euclidean(p11, p21)
+    print("distance scale factor real: ", d2/d1)
 
     for f in out["frames"]:
         f["transform_matrix"] = f["transform_matrix"].tolist()
     print(nframes,"frames")
+
+    scale_factor =  camera_scale_factor / avglen
+    out['scale_factor'] = scale_factor
 
 
 def process_scannet(input_root, step_size=10):
@@ -309,9 +320,15 @@ if __name__=='__main__':
     # input_root='./outputs/replica_multi_room'
     # dump_path = './outputs/replica_multi_room/transforms.json'
     select_index = None
-    input_root='data/replica_apart2_instance'
-    dump_path = './data/replica_apart2_instance/transforms.json'
+    # input_root='data/replica_apart2_instance'
+    # dump_path = './data/replica_apart2_instance/transforms.json'
 
+    # input_root='data/replica_apart2_dinning_room'
+    # dump_path = './data/replica_apart2_dinning_room/transforms.json'
+    
+    input_root='test_output'
+    dump_path='test_output/transforms.json'
+    
     # input_root='./outputs/replica_singleroom'
     # dump_path = './outputs/replica_singleroom/transforms.json'
     # input_root='./outputs/test_sim'

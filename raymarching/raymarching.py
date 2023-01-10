@@ -276,6 +276,7 @@ class _composite_rays_train(Function):
         # NOTE: grad_depth is not used now! It won't be propagated to sigmas.
 
         grad_weights_sum = grad_weights_sum.contiguous()
+        grad_depth = grad_depth.contiguous()
         grad_image = grad_image.contiguous()
 
         sigmas, rgbs, deltas, rays, weights_sum, depth, image = ctx.saved_tensors
@@ -284,13 +285,13 @@ class _composite_rays_train(Function):
         grad_sigmas = torch.zeros_like(sigmas)
         grad_rgbs = torch.zeros_like(rgbs)
 
-        _backend.composite_rays_train_backward(grad_weights_sum, grad_image, sigmas, rgbs, deltas, rays, weights_sum, image, M, N, T_thresh, grad_sigmas, grad_rgbs)
+        # _backend.composite_rays_train_backward(grad_weights_sum, grad_image, sigmas, rgbs, deltas, rays, weights_sum, image, M, N, T_thresh, grad_sigmas, grad_rgbs)
+        _backend.composite_rays_train_backward(grad_weights_sum, grad_image, grad_depth, depth, sigmas, rgbs, deltas, rays, weights_sum, image, M, N, T_thresh, grad_sigmas, grad_rgbs)
 
         return grad_sigmas, grad_rgbs, None, None, None
 
 
 composite_rays_train = _composite_rays_train.apply
-
 
 class _composite_rays_train_sem(Function):
     @staticmethod

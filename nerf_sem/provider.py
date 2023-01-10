@@ -15,7 +15,8 @@ from torch.utils.data import DataLoader
 from .utils import get_rays
 
 from scipy import interpolate
-
+from skimage.transform import resize_local_mean
+from PIL import Image
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
 def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
     # for the fox dataset, 0.33 scales camera radius to ~ 2
@@ -118,8 +119,11 @@ class NeRFDataset:
             transform = json.load(f)
 
         # replica apartment 2 dining room
-        test_index = [210, 248]
-        verify_index = [51, 67, 100, 192, 224, 237]
+        # test_index = [210, 248]
+        # verify_index = [51, 67, 100, 192, 224, 237]
+        test_index = []
+        verify_index = [50,100,150,200,230,300,350,400]
+
         self.test_len = len(test_index)
 
         self.target_labels = set() # only for classification sem model
@@ -136,6 +140,9 @@ class NeRFDataset:
         frames = transform["frames"]
         #frames = sorted(frames, key=lambda d: d['file_path']) # why do I sort...
         
+        # TODO: hard to get correct scale_factor
+        self.scale_factor = transform['scale_factor'] * self.scale
+
         # for colmap, manually interpolate a test set.
         if type == 'test':
             # choose two random poses, and interpolate between.
@@ -163,10 +170,12 @@ class NeRFDataset:
             self.poses = []
             self.images = []
             self.sem_datas = []
+            self.depths = []
             self.sem_label_map = []
 
             self.poses_extra = []
             self.images_extra = []
+            self.depths_extra = []
             self.sem_datas_extra = []
 
             for k, f in enumerate(tqdm.tqdm(frames, desc=f'Loading {type} data')):
@@ -216,6 +225,23 @@ class NeRFDataset:
 
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
+                if self.opt.depth_sup:
+                    f_path_depth = os.path.join(self.root_path, 'depth', f"{img_idx}.npy")
+                    depth_data = np.load(f_path_depth)
+                    # depth_data[depth_data==0] = 500000 # TODO give large value for inf depth 
+                    
+                    if os.environ.get('DEBUG', False):
+                        def depth_observation(depth_obs):
+                            depth_img = Image.fromarray((depth_obs / np.amax(depth_obs) * 255).astype(np.uint8), mode="L")
+                            depth_img.show()
+                    if depth_data.shape[0] != self.H or depth_data.shape[1] != self.W:
+                        if os.environ.get('DEBUG', False):
+                            depth_observation(depth_data)
+                        depth_data = resize_local_mean(depth_data, (self.H, self.W), preserve_range=True)
+                        depth_data = depth_data / 1000 * self.scale_factor
+                        if os.environ.get('DEBUG', False):
+                            depth_observation(depth_data)
+
                 if 'rgb' in self.opt.sem_mode:
                     if len(sem_data.shape) == 2:
                         # for single value semantic map
@@ -237,10 +263,14 @@ class NeRFDataset:
                     self.poses_extra.append(pose)
                     self.images_extra.append(image)
                     self.sem_datas_extra.append(sem_data)
+                    if self.opt.depth_sup:
+                        self.depths_extra.append(depth_data)
                 else:
                     self.poses.append(pose)
                     self.images.append(image)
                     self.sem_datas.append(sem_data)
+                    if self.opt.depth_sup:
+                        self.depths.append(depth_data)
 
 
         # NOTE: copy a set of frames as verification of training quality
@@ -250,17 +280,23 @@ class NeRFDataset:
         self.poses_verify = [p for i, p in enumerate(self.poses) if i in verify_index ]
         self.images_verify = [im for i, im in enumerate(self.images) if i in verify_index ]
         self.sem_datas_verify = [im for i, im in enumerate(self.sem_datas) if i in verify_index ]
+        if self.opt.depth_sup:
+            self.depths_datas_verify = [im for i, im in enumerate(self.depths) if i in verify_index ]
 
         # TODO: append several not trained data
         self.poses_verify += self.poses_extra
         self.images_verify += self.images_extra
         self.sem_datas_verify += self.sem_datas_extra
+        if self.opt.depth_sup:
+            self.depths_datas_verify += self.depths_extra
 
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
         if self.sem_datas is not None:
             self.sem_datas = torch.from_numpy(np.stack(self.sem_datas, axis=0))
+        if self.opt.depth_sup:
+            self.depths = torch.from_numpy(np.stack(self.depths, axis=0))
  
         # calculate mean radius of all camera poses
         self.radius = self.poses[:, :3, 3].norm(dim=-1).mean(0).item()
@@ -288,6 +324,9 @@ class NeRFDataset:
                     dtype = torch.float
                 self.images = self.images.to(dtype).to(self.device)
                 self.sem_datas = self.sem_datas.to(dtype).to(self.device)
+                if self.opt.depth_sup:
+                    self.depths = self.depths.to(dtype).to(self.device)
+
             if self.error_map is not None:
                 self.error_map = self.error_map.to(self.device)
 
@@ -367,6 +406,14 @@ class NeRFDataset:
                     sem_datas = torch.gather(sem_datas.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
             results['images_sem'] = sem_datas 
         
+        if self.opt.depth_sup:
+            depths = self.depths[index].to(self.device) # [B, H, W, none/3/4]
+
+            if self.training:
+                C = depths.shape[-1]
+                depths = torch.gather(depths.view(B, -1), 1, rays['inds'])
+            results['images_depth'] = depths 
+
         # need inds to update error_map
         if error_map is not None:
             results['index'] = index

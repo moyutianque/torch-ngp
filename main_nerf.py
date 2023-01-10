@@ -79,6 +79,9 @@ if __name__ == '__main__':
     parser.add_argument('--sem_mode', choices=['label_rgb', 'ins_rgb', 'label_id', 'ins_id'], default='ins_rgb', type=str)
     parser.add_argument('--split_sem_code', action='store_true', help="")
     parser.add_argument('--sigma_dropout', type=int, default=0, help="sigma dropout")
+    parser.add_argument('--depth_sup', action='store_true', help="include depth supervision")
+    parser.add_argument('--post_3dmap_loss', action='store_true', help="include depth supervision")
+    parser.add_argument('--density_sample_size', type=int, default=2000, help="sigma dropout")
 
     opt = parser.parse_args()
 
