@@ -9,27 +9,29 @@ import quaternion
 hfov = float(90) * np.pi / 180.
 
 def depth2points(depth_im, extrinsic_info, mode='plane'):
-    fl_x=320
-    fl_y=240
-    cx=319.5
-    cy=239.5
-    # cx=320
-    # cy=240
+    height, width = depth_im.shape
+    vfov = 2 * np.arctan(np.tan(hfov/2)*height/width)
+    fx = 1.0 / np.tan(hfov / 2.)
+    fy = 1.0 / np.tan(vfov / 2.)
+    K = np.array([
+        [fx, 0., 0., 0.],
+        [0., fy, 0., 0.],
+        [0., 0., 1., 0.],
+        [0., 0., 0., 1.]]
+    )
 
     H, W = depth_im.shape
-    xs, ys = np.meshgrid(np.arange(W), np.arange(H-1,-1,-1))
-    depth = depth_im.reshape(1,H,W)/1000
+    xs, ys = np.meshgrid(np.linspace(-1,1,W), np.linspace(1,-1,H))
+    depth = depth_im.reshape(1,H,W)
     xs = xs.reshape(1,H,W)
     ys = ys.reshape(1,H,W)
 
-    xs = (xs - fl_x) / cx
-    ys = (ys - fl_y) / cy
-
     xys = np.vstack((xs * depth , ys * depth, -depth, np.ones(depth.shape)))
+    xys = xys.reshape(4, -1)
     msk = depth > 0
     msk = msk.flatten()
-    xys = xys.reshape(4, -1)
-    xy_c0 = xys[:, msk]
+    xys = xys[:, msk]
+    xy_c0 = np.matmul(np.linalg.inv(K), xys)
 
     translation = np.array(extrinsic_info['habitat_cam_pos']['position'])
     orientation = quaternion.from_float_array(np.array(extrinsic_info['habitat_cam_pos']['rotation']))
@@ -44,6 +46,7 @@ def depth2points(depth_im, extrinsic_info, mode='plane'):
 
 
 def run(depth_root):
+
     file_paths = []
     cam_poses = []
     cam_poses = []
@@ -59,10 +62,10 @@ def run(depth_root):
     # cam_poses = [cam_poses[64],  cam_poses[65]]
     # file_paths = [file_paths[63], file_paths[97]]
     # cam_poses = [cam_poses[63], cam_poses[97]]
-    # file_paths = file_paths[::40]
-    # cam_poses = cam_poses[::40]
     # file_paths = [file_paths[0], file_paths[1]]
     # cam_poses = [cam_poses[0], cam_poses[1]]
+    # file_paths = file_paths[::40]
+    # cam_poses = cam_poses[::40]
 
     pcd_nps = []
     for file_name, cam_pose in zip(file_paths, cam_poses):
@@ -76,6 +79,6 @@ def run(depth_root):
     o3d.visualization.draw_geometries([pcd_o3d])
 
 if __name__ == '__main__':
-    # depth_root = '/media/zeke/project_data/Projects/torch-ngp/my_local_process/run_sim/test_output'
+    depth_root = '/media/zeke/project_data/Projects/torch-ngp/my_local_process/run_sim/test_output'
     depth_root = '/media/zeke/project_data/Projects/torch-ngp/my_local_process/run_sim/test_output-bk'
     run(depth_root)
