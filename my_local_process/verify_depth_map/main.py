@@ -9,21 +9,26 @@ import quaternion
 hfov = float(90) * np.pi / 180.
 
 def depth2points(depth_im, extrinsic_info, mode='plane'):
-    fl_x=320
-    fl_y=240
+    H, W = depth_im.shape
+    vfov = 2 * np.arctan(np.tan(hfov/2)*H/W)
+    fl_x = W / (2 * np.tan(hfov / 2.)) # 320
+    fl_y = H / (2 * np.tan(vfov / 2.)) # 320
+
+    # fl_x=320
+    # # fl_y=240
+    # fl_y=320
     cx=319.5
     cy=239.5
-    # cx=320
-    # cy=240
+    cx=320
+    cy=240
 
-    H, W = depth_im.shape
     xs, ys = np.meshgrid(np.arange(W), np.arange(H-1,-1,-1))
     depth = depth_im.reshape(1,H,W)/1000
     xs = xs.reshape(1,H,W)
     ys = ys.reshape(1,H,W)
 
-    xs = (xs - fl_x) / cx
-    ys = (ys - fl_y) / cy
+    xs = (xs - cx) / fl_x
+    ys = (ys - cy) / fl_y
 
     xys = np.vstack((xs * depth , ys * depth, -depth, np.ones(depth.shape)))
     msk = depth > 0
