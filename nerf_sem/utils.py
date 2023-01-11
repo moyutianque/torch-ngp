@@ -562,7 +562,12 @@ class Trainer(object):
         # NOTE: MSE depth loss
         loss_depth = None
         if self.opt.depth_sup:
-            loss_depth = self.criterion(pred_depth, gt_depth).mean()
+            loss_depth = torch.abs(torch.log(gt_depth)-torch.log(pred_depth))
+            # loss_depth = self.criterion(torch.log(pred_depth), torch.log(gt_depth)) 
+            filtered_idx = (~torch.isinf(loss_depth)) & (~torch.isnan(loss_depth))
+            loss_depth = loss_depth[filtered_idx].mean()
+            print(loss_depth.item())
+            # loss_depth = self.criterion(pred_depth, gt_depth).mean()
 
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
@@ -868,7 +873,7 @@ class Trainer(object):
                 preds, truths, loss_dict = self.train_step(data)
             
             tot_loss = loss_dict['loss_rgb'].clone()
-            # tot_loss = 0
+            tot_loss = 0
         
             # NOTE: loss merge
             if (loss_dict['loss_sem'] is not None) and (self.global_step > self.opt.warmup_iter):
@@ -878,6 +883,7 @@ class Trainer(object):
                     tot_loss += 1. * loss_dict['loss_dist']
 
             if loss_dict['loss_depth'] is not None:
+                print(loss_dict['loss_depth'].item())
                 tot_loss += loss_dict['loss_depth']
                 
             # if loss_dict['loss_dist'] is not None:

@@ -96,7 +96,7 @@ def run(depth_root):
         color_list = np.vstack(color_list)
         pcd_o3d.colors = o3d.utility.Vector3dVector(color_list/255.0)
     o3d.visualization.draw_geometries([pcd_o3d])
-    # o3d.io.write_point_cloud("./data.ply", pcd_o3d)
+    o3d.io.write_point_cloud("./data.ply", pcd_o3d)
 
 
 if __name__ == '__main__':

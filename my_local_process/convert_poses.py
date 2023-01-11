@@ -27,32 +27,32 @@ h=968
 
 ## Replica
 fl_x=320
-fl_y=240
-cx=319.5
-cy=239.5
+fl_y=320
+cx=320
+cy=240
 w=640
 h=480
 
-## Replica
-fl_x=400
-fl_y=300
-cx=399.5
-cy=299.5
-w=800
-h=600
+# ## Replica
+# fl_x=400
+# fl_y=400
+# cx=400
+# cy=300
+# w=800
+# h=600
 
 
 SEM=False
 AABB_SCALE=2
 camera_scale_factor=2 # scale the camera position by factor
-camera_angle_x = math.atan(w / (fl_x * 2)) * 2
-camera_angle_y = math.atan(h / (fl_y * 2)) * 2
+fov_x = math.atan(w / (fl_x * 2)) * 2
+fov_y = math.atan(h / (fl_y * 2)) * 2
 
 k1=k2=p1=p2=0.0
 
 out = {
-    "camera_angle_x": camera_angle_x,
-    "camera_angle_y": camera_angle_y,
+    "camera_angle_x": fov_x,
+    "camera_angle_y": fov_y,
     "fl_x": fl_x,
     "fl_y": fl_y,
     "k1": k1,
@@ -169,7 +169,6 @@ def post_processing(up=None):
     scale_factor =  camera_scale_factor / avglen
     out['scale_factor'] = scale_factor
 
-
 def process_scannet(input_root, step_size=10):
     if SEM:
         rgb_path = osp.join(input_root, '../semseg2')
@@ -199,73 +198,6 @@ def process_scannet(input_root, step_size=10):
 
     post_processing(up)
 
-# extra_xf = np.matrix([
-#             [-1, 0, 0, 0],
-#             [ 0, 0, 1, 0],
-#             [ 0, 1, 0, 0],
-#             [ 0, 0, 0, 1]])
-# # NerF will cycle forward, so lets cycle backward.
-# shift_coords = np.matrix([
-#     [0, 0, 1, 0],
-#     [1, 0, 0, 0],
-#     [0, 1, 0, 0],
-#     [0, 0, 0, 1]])
-
-def Rx(theta):
-    return np.matrix([[ 1, 0            , 0            ,0],
-                    [ 0, np.cos(theta),-np.sin(theta),0],
-                    [ 0, np.sin(theta), np.cos(theta),0],
-                    [0,0,0,1]])
-def Ry(theta):
-    return np.matrix([[ np.cos(theta), 0, np.sin(theta),0],
-                    [ 0            , 1, 0            ,0],
-                    [-np.sin(theta), 0, np.cos(theta),0],
-                    [0,0,0,1]])
-def Rz(theta):
-    return np.matrix([[ np.cos(theta), -np.sin(theta), 0 , 0],
-                    [ np.sin(theta), np.cos(theta) , 0 , 0],
-                    [ 0            , 0             , 1 , 1],
-                    [0,0,0,1]])
-
-def transfer_back(m):
-    T = np.array([[1, 0, 0, 0],
-                [0, np.cos(np.pi), -np.sin(np.pi), 0],
-                [0, np.sin(np.pi), np.cos(np.pi), 0],
-                [0, 0, 0, 1]])
-    return m @ np.linalg.inv(T)
-
-def generate_transform_matrix(c2w):
-    # https://github.com/NVlabs/instant-ngp/issues/72
-    pos = c2w[0:3, 3]
-    xf_rot = np.eye(4)
-    xf_rot[:3,:3] = c2w[:3,:3]
-
-    xf_pos = np.eye(4)
-    # xf_pos[:3,3] = pos - average_position
-    xf_pos[:3,3] = pos
-
-    # barbershop_mirros_hd_dense:
-    # - camera plane is y+z plane, meaning: constant x-values
-    # - cameras look to +x
-
-    # Don't ask me...
-    extra_xf = np.matrix([
-        [-1, 0, 0, 0],
-        [ 0, 0, 1, 0],
-        [ 0, 1, 0, 0],
-        [ 0, 0, 0, 1]])
-    # NerF will cycle forward, so lets cycle backward.
-    shift_coords = np.matrix([
-        [0, 0, 1, 0],
-        [1, 0, 0, 0],
-        [0, 1, 0, 0],
-        [0, 0, 0, 1]])
-    xf = shift_coords @ extra_xf @ xf_pos
-    assert np.abs(np.linalg.det(xf) - 1.0) < 1e-4
-    xf = xf @ xf_rot
-    xf = np.asarray(xf)
-    return xf
-
 def process_replica(input_root, step_size=10, select_index=None):
     rgb_path = osp.join(input_root, 'color')
     traj_file = osp.join(input_root, 'traj.txt')
@@ -282,8 +214,7 @@ def process_replica(input_root, step_size=10, select_index=None):
 
         if (select_index is not None) and (i not in select_index):
             continue
-        # im_name = osp.join(rgb_path, f"rgb_{i}.png")
-        # name=f'rgb/rgb_{i}.png'
+
         im_name = osp.join(rgb_path, f"{i}.png")
         name=f'color/{i}.png'
         sem_name=f'sem/{i}.png'
@@ -291,7 +222,7 @@ def process_replica(input_root, step_size=10, select_index=None):
         b=sharpness(im_name)
         print(name, "sharpness=",b)
         c2w = poses[i]
-        # c2w = generate_transform_matrix(c2w)
+
         # TODO not known whether helpful
         c2w[:3, 1] *= -1
         c2w[:3, 2] *= -1
@@ -328,6 +259,9 @@ if __name__=='__main__':
     
     input_root='test_output'
     dump_path='test_output/transforms.json'
+    
+    # input_root='/media/zeke/project_data/Projects/torch-ngp/data/replica_multiroom2'
+    # dump_path='/media/zeke/project_data/Projects/torch-ngp/data/replica_multiroom2/transforms.json'
     
     # input_root='./outputs/replica_singleroom'
     # dump_path = './outputs/replica_singleroom/transforms.json'
