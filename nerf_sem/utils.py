@@ -702,10 +702,16 @@ class Trainer(object):
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, global_step=self.global_step, **vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(-1, H, W, 3)
-        pred_depth = outputs['depth'].reshape(-1, H, W)
+        pred_depth_normalized=None
+        if 'depth_normalized' in outputs:
+            pred_depth_normalized = outputs['depth_normalized'].reshape(-1, H, W)
+            pred_depth = outputs['depth'].reshape(-1, H, W)
+        else:
+            pred_depth_normalized = outputs['depth'].reshape(-1, H, W)
+
         pred_sem = outputs['image_sem'].reshape(-1, H, W, self.model.sem_out_dim)
 
-        return pred_rgb, pred_depth, pred_sem
+        return pred_rgb, pred_depth_normalized, pred_sem, pred_depth
 
 
     def save_mesh(self, save_path=None, resolution=256, threshold=10):
@@ -807,7 +813,7 @@ class Trainer(object):
             for i, data in enumerate(loader):
                 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, preds_sem = self.test_step(data)
+                    preds, preds_depth, preds_sem, preds_depth_ori = self.test_step(data)
 
                 if self.opt.color_space == 'linear':
                     preds = linear_to_srgb(preds)
@@ -837,6 +843,10 @@ class Trainer(object):
     
     # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
     def train_gui(self, train_loader, step=16, val_data=None, iters=0, sem_map_type='rgb'):
+
+        if os.environ.get('GETDEPTH', False):
+            self.get_view_sythesis(val_data, train_loader._data.intrinsics, train_loader._data.test_len, self.global_step, sem_map_type)
+            import ipdb;ipdb.set_trace() # breakpoint 849
 
         self.model.train()
 
@@ -873,7 +883,7 @@ class Trainer(object):
                 preds, truths, loss_dict = self.train_step(data)
             
             tot_loss = loss_dict['loss_rgb'].clone()
-            tot_loss = 0
+            # tot_loss = 0
         
             # NOTE: loss merge
             if (loss_dict['loss_sem'] is not None) and (self.global_step > self.opt.warmup_iter):
@@ -954,6 +964,8 @@ class Trainer(object):
 
             if self.global_step != 0 and (self.global_step % self.opt.save_iter == 0):
                 self.get_view_sythesis(val_data, train_loader._data.intrinsics, train_loader._data.test_len, self.global_step, sem_map_type)
+                self.save_checkpoint(full=True, best=False, remove_old=False)
+                self.epoch += 1
 
         if self.ema is not None:
             self.ema.update()
@@ -986,7 +998,11 @@ class Trainer(object):
         psnr_list_oldview = []
         sem_diff = []
         sem_diff_old = []
-        for j, (p, im, im_sem) in enumerate(zip(*val_data)):
+        for j, item in enumerate(zip(*val_data)):
+            if self.opt.depth_sup:
+                (p, im, im_sem, im_depth) = item
+            else:
+                (p, im, im_sem) = item
             test_output = self.test_gui(
                     p, intrinsics, 
                     im.shape[1], im.shape[0], bg_color=torch.ones(3, dtype=torch.float32)
@@ -995,6 +1011,7 @@ class Trainer(object):
             img_rgb = (im * 255).astype(np.uint8)
             pred = (test_output['image'] * 255).astype(np.uint8)
             pred_depth = (test_output['depth'] * 255).astype(np.uint8)
+            depth_ori = test_output['depth_ori']
 
             if sem_map_type == 'rgb':
                 img_sem = (im_sem * 255).astype(np.uint8)
@@ -1029,6 +1046,14 @@ class Trainer(object):
             cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_sem_{prefix}gt.png'), cv2.cvtColor(img_sem, cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_sem_{prefix}.png'), cv2.cvtColor(pred_sem, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_depth_{prefix}.png'), pred_depth)
+
+            f_path = os.path.join(save_path, f'{iters}_{j}_depth_{prefix}.npy')
+            np.save(f_path, depth_ori)
+            if self.opt.depth_sup:
+                f_path = os.path.join(save_path, f'{iters}_{j}_depth_{prefix}_gt.npy')
+                np.save(f_path, im_depth)
+
             cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_depth_{prefix}.png'), pred_depth)
             val_results.append(test_output)
         
@@ -1076,7 +1101,7 @@ class Trainer(object):
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 # here spp is used as perturb random seed! (but not perturb the first sample)
-                preds, preds_depth, preds_sem = self.test_step(data, bg_color=bg_color, perturb=False if spp == 1 else spp)
+                preds, preds_depth, preds_sem, preds_depth_ori = self.test_step(data, bg_color=bg_color, perturb=False if spp == 1 else spp)
 
         if self.ema is not None:
             self.ema.restore()
@@ -1095,12 +1120,14 @@ class Trainer(object):
 
         pred = preds[0].detach().cpu().numpy()
         pred_depth = preds_depth[0].detach().cpu().numpy()
+        preds_depth_ori = preds_depth_ori[0].detach().cpu().numpy()
         preds_sem = preds_sem[0].detach().cpu().numpy()
 
         outputs = {
             'image': pred,
             'depth': pred_depth,
             'sem': preds_sem,
+            'depth_ori': preds_depth_ori
         }
 
         return outputs

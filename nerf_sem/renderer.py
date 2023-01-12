@@ -471,7 +471,9 @@ class NeRFRenderer(nn.Module):
             image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
 
             # NOTE: check wether need to standardize will supervision on depth
-            depth = torch.clamp(depth - nears, min=0) / (fars - nears)
+            # depth = torch.clamp(depth - nears, min=0) / (fars - nears)
+            depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
+            depth_normalized = depth_normalized.view(*prefix)
             image = image.view(*prefix, 3)
             depth = depth.view(*prefix)
 
@@ -518,6 +520,7 @@ class NeRFRenderer(nn.Module):
             image_sem = image_sem.view(*prefix, self.sem_out_dim)
         
         results['depth'] = depth
+        results['depth_normalized'] = depth_normalized
         results['image'] = image
         results['image_sem'] = image_sem
 

@@ -228,7 +228,7 @@ class NeRFDataset:
                 if self.opt.depth_sup:
                     f_path_depth = os.path.join(self.root_path, 'depth', f"{img_idx}.npy")
                     depth_data = np.load(f_path_depth)
-                    depth_data[depth_data==0] = 50000 # TODO give large value for inf depth 
+                    depth_data[depth_data==0] = 20000 # TODO give large value for inf depth 
                     
                     if os.environ.get('DEBUG', False):
                         def depth_observation(depth_obs):
@@ -246,7 +246,7 @@ class NeRFDataset:
                         f = transform['fl_x']
                         for i in range(self.W):
                             for j in range(self.H):
-                                depth_data[j, i] = np.sqrt(f**2 + (i-transform['cx'])**2 + (j-transform['cy']**2)) * depth_data[j,i]/f
+                                depth_data[j, i] = np.sqrt(f**2 + (i-transform['cx'])**2 + (j-transform['cy'])**2) * depth_data[j,i]/f
 
                 if 'rgb' in self.opt.sem_mode:
                     if len(sem_data.shape) == 2:

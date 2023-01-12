@@ -73,11 +73,20 @@ class NeRFGUI:
         self.trainer = trainer
         self.train_loader = train_loader
         
-        self.val_data = [
-            train_loader._data.poses_verify, 
-            train_loader._data.images_verify,
-            train_loader._data.sem_datas_verify,
-        ]
+        if self.opt.depth_sup:
+            self.val_data = [
+                train_loader._data.poses_verify, 
+                train_loader._data.images_verify,
+                train_loader._data.sem_datas_verify,
+                train_loader._data.depths_datas_verify,
+            ]
+
+        else:
+            self.val_data = [
+                train_loader._data.poses_verify, 
+                train_loader._data.images_verify,
+                train_loader._data.sem_datas_verify,
+            ]
 
         if train_loader is not None:
             self.trainer.error_map = train_loader._data.error_map
@@ -149,7 +158,6 @@ class NeRFGUI:
     
     def test_step(self):
         # TODO: seems we have to move data from GPU --> CPU --> GPU?
-
         if self.need_update or self.spp < self.opt.max_spp:
         
             starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
