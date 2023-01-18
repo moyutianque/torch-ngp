@@ -34,6 +34,8 @@ import h5py
 from constants import d3_40_colors_rgb
 from math import log10, sqrt
 
+from nerf_sem.reprojection_loss import reprojection_loss, test_reprojection
+
 def np_PSNR(original, compressed):
     if original.shape[2] == 4:
         original = original[:,:,:3]
@@ -562,6 +564,8 @@ class Trainer(object):
         # NOTE: MSE depth loss
         loss_depth = None
         if self.opt.depth_sup:
+            if not self.opt.radial_depth:
+                pred_depth = pred_depth * data['depth_radial2plane']
             loss_depth = torch.abs(torch.log(gt_depth)-torch.log(pred_depth))
             # loss_depth = self.criterion(torch.log(pred_depth), torch.log(gt_depth)) 
             filtered_idx = (~torch.isinf(loss_depth)) & (~torch.isnan(loss_depth))
@@ -764,7 +768,7 @@ class Trainer(object):
 
         # mark untrained region (i.e., not covered by any camera from the training dataset)
         if self.model.cuda_ray:
-            self.model.mark_untrained_grid(train_loader._data.poses, train_loader._data.intrinsics)
+            self.model.mark_untrained_grid(train_loader._data.poses_train, train_loader._data.intrinsics)
 
         # get a ref to error_map
         self.error_map = train_loader._data.error_map
@@ -811,7 +815,7 @@ class Trainer(object):
         with torch.no_grad():
 
             for i, data in enumerate(loader):
-                
+        
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     preds, preds_depth, preds_sem, preds_depth_ori = self.test_step(data)
 
@@ -843,7 +847,6 @@ class Trainer(object):
     
     # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
     def train_gui(self, train_loader, step=16, val_data=None, iters=0, sem_map_type='rgb'):
-
         if os.environ.get('GETDEPTH', False):
             self.get_view_sythesis(val_data, train_loader._data.intrinsics, train_loader._data.test_len, self.global_step, sem_map_type)
             import ipdb;ipdb.set_trace() # breakpoint 849
@@ -859,7 +862,7 @@ class Trainer(object):
 
         # mark untrained grid
         if self.global_step == 0:
-            self.model.mark_untrained_grid(train_loader._data.poses, train_loader._data.intrinsics)
+            self.model.mark_untrained_grid(train_loader._data.poses_train, train_loader._data.intrinsics)
 
         for _ in range(step):
             
@@ -883,7 +886,7 @@ class Trainer(object):
                 preds, truths, loss_dict = self.train_step(data)
             
             tot_loss = loss_dict['loss_rgb'].clone()
-            # tot_loss = 0
+            tot_loss = 0
         
             # NOTE: loss merge
             if (loss_dict['loss_sem'] is not None) and (self.global_step > self.opt.warmup_iter):
@@ -1000,9 +1003,30 @@ class Trainer(object):
         sem_diff_old = []
         for j, item in enumerate(zip(*val_data)):
             if self.opt.depth_sup:
-                (p, im, im_sem, im_depth) = item
+                if self.opt.reprojection_loss:
+                    (p, im, im_sem, im_depth, nearby_view) = item
+                else:
+                    (p, im, im_sem, im_depth) = item
             else:
                 (p, im, im_sem) = item
+            
+            # NOTE ground truth reprojection verification
+            if self.opt.reprojection_loss:
+                H, W = im.shape[:2]
+                xs, ys = np.meshgrid(np.arange(W), np.arange(H))
+                xs = xs.flatten(); ys = ys.flatten()
+                pix_pts = np.transpose(np.vstack([xs, ys]))
+ 
+                projected_rgb = reprojection_loss(pix_pts, im_depth, intrinsics, p, nearby_view['pose'], nearby_view['depth'], rgb = im)
+                
+                img_rgb = (projected_rgb * 255).astype(np.uint8)
+                cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_wrap.png'), cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+                target_rgb = (nearby_view['rgb'] * 255).astype(np.uint8)
+                cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_target.png'), cv2.cvtColor(target_rgb, cv2.COLOR_RGB2BGR))
+                ori_rgb = (im* 255).astype(np.uint8)
+                cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_original.png'), cv2.cvtColor(ori_rgb, cv2.COLOR_RGB2BGR))
+                import ipdb;ipdb.set_trace() # breakpoint 1024
+
             test_output = self.test_gui(
                     p, intrinsics, 
                     im.shape[1], im.shape[0], bg_color=torch.ones(3, dtype=torch.float32)

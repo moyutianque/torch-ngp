@@ -73,20 +73,17 @@ class NeRFGUI:
         self.trainer = trainer
         self.train_loader = train_loader
         
-        if self.opt.depth_sup:
-            self.val_data = [
-                train_loader._data.poses_verify, 
-                train_loader._data.images_verify,
-                train_loader._data.sem_datas_verify,
-                train_loader._data.depths_datas_verify,
-            ]
 
-        else:
-            self.val_data = [
-                train_loader._data.poses_verify, 
-                train_loader._data.images_verify,
-                train_loader._data.sem_datas_verify,
-            ]
+        self.val_data = [
+            train_loader._data.poses_verify, 
+            train_loader._data.images_verify,
+            train_loader._data.sem_datas_verify,
+        ]
+        if self.opt.depth_sup:
+            self.val_data += [train_loader._data.depths_datas_verify]
+        
+        if self.opt.reprojection_loss:
+            self.val_data += [train_loader._data.nearby_views_verify]
 
         if train_loader is not None:
             self.trainer.error_map = train_loader._data.error_map
@@ -429,19 +426,29 @@ class NeRFGUI:
                 dpg.set_value("_log_pose", str(self.cam.pose))
 
 
-        def callback_camera_wheel_scale(sender, app_data):
+        # def callback_camera_wheel_scale(sender, app_data):
 
+        #     if not dpg.is_item_focused("_primary_window"):
+        #         return
+
+        #     delta = app_data
+
+        #     self.cam.scale(delta)
+        #     self.need_update = True
+
+        #     if self.debug:
+        #         dpg.set_value("_log_pose", str(self.cam.pose))
+
+        def callback_camera_wheel_scale(sender, app_data):
             if not dpg.is_item_focused("_primary_window"):
                 return
 
             delta = app_data
-
-            self.cam.scale(delta)
+            self.cam.pan(0, 0, -delta*100)
             self.need_update = True
 
             if self.debug:
                 dpg.set_value("_log_pose", str(self.cam.pose))
-
 
         def callback_camera_drag_pan(sender, app_data):
 

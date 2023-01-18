@@ -83,6 +83,7 @@ if __name__ == '__main__':
     parser.add_argument('--post_3dmap_loss', action='store_true', help="include depth supervision")
     parser.add_argument('--density_sample_size', type=int, default=2000, help="sigma dropout")
     parser.add_argument('--radial_depth', action='store_true', help="change plane-to-plane depth to radial length")
+    parser.add_argument('--reprojection_loss', action='store_true', help="reprojection")
 
     opt = parser.parse_args()
 
