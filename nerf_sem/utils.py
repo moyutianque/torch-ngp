@@ -405,9 +405,9 @@ class Trainer(object):
         self.criterion_sem = criterion_sem
 
         # optionally use LPIPS loss for patch-based training
-        if self.opt.patch_size > 1:
-            import lpips
-            self.criterion_lpips = lpips.LPIPS(net='alex').to(self.device)
+        # if self.opt.patch_size > 1:
+        #     import lpips
+        #     self.criterion_lpips = lpips.LPIPS(net='alex').to(self.device)
 
         if optimizer is None:
             self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam

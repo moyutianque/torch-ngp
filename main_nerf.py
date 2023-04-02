@@ -76,7 +76,7 @@ if __name__ == '__main__':
     parser.add_argument('--dist_start', type=int, default=15000)
     parser.add_argument('--distortion_loss', action='store_true', help="distortion loss of mip nerf 360")
     parser.add_argument('--depth_reg', action='store_true', help="depth regularization loss of regnerf")
-    parser.add_argument('--sem_mode', choices=['label_rgb', 'ins_rgb', 'label_id', 'ins_id'], default='ins_rgb', type=str)
+    parser.add_argument('--sem_mode', choices=['label_rgb', 'ins_rgb', 'label_id', 'ins_id'], default='label_id', type=str)
     parser.add_argument('--split_sem_code', action='store_true', help="")
     parser.add_argument('--sigma_dropout', type=int, default=0, help="sigma dropout")
     parser.add_argument('--depth_sup', action='store_true', help="include depth supervision")

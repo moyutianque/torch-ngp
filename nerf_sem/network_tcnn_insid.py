@@ -357,7 +357,7 @@ class NeRFNetwork(NeRFRenderer):
             {'params': self.sem_net.parameters(), 'lr': lr},  # NOTE zehao @ Dec 13, forget to add previously
             {'params': self.latent_proj.parameters(), 'lr': lr}
         ]
-        if self.low_res_img:
+        if self.use_latent and self.low_res_img:
             params.append({'params': self.color_net_low_res.parameters(), 'lr': lr})
         if self.bg_radius > 0:
             params.append({'params': self.encoder_bg.parameters(), 'lr': lr})

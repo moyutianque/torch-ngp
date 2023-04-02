@@ -430,8 +430,7 @@ class NeRFDataset:
         cy = (transform['cy'] / downscale) if 'cy' in transform else (self.H / 2)
     
         self.intrinsics = np.array([fl_x, fl_y, cx, cy])
-
-        if self.opt.latent_space == 'original' or self.opt.low_res_img:
+        if (self.opt.latent and self.opt.latent_space == 'original') or self.opt.low_res_img:
             self.intrinsics = self.intrinsics/8
  
     @property
