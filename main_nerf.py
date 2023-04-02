@@ -7,7 +7,7 @@ from nerf_sem.utils import *
 
 from functools import partial
 from loss import huber_loss
-
+from diffusers import StableDiffusionImg2ImgPipeline
 #torch.autograd.set_detect_anomaly(True)
 
 if __name__ == '__main__':
@@ -84,6 +84,10 @@ if __name__ == '__main__':
     parser.add_argument('--density_sample_size', type=int, default=2000, help="sigma dropout")
     parser.add_argument('--radial_depth', action='store_true', help="change plane-to-plane depth to radial length")
     parser.add_argument('--reprojection_loss', action='store_true', help="reprojection")
+    parser.add_argument('--latent', action='store_true', help="latent nerf")
+    parser.add_argument('--latent_space', choices=['original', 'img_size'], default='original', type=str)
+    parser.add_argument('--latent_dim', type=int, default=4, help="latent dimt")
+    parser.add_argument('--low_res_img', action='store_true', help="latent nerf with low res image")
 
     opt = parser.parse_args()
 
@@ -135,6 +139,16 @@ if __name__ == '__main__':
     #criterion = torch.nn.HuberLoss(reduction='none', beta=0.1) # only available after torch 1.10 ?
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    vae=None
+    if opt.latent:
+        pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+            "stabilityai/stable-diffusion-2-1", 
+            use_auth_token=True
+        )
+        vae = pipe.vae
+        vae = vae.to(device)
+        vae = vae.eval()
     
     if opt.test:
         
@@ -159,7 +173,7 @@ if __name__ == '__main__':
             gui.render()
         
         else:
-            test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
+            test_loader = NeRFDataset(opt, device=device, type='test', vae=vae).dataloader()
 
             if test_loader.has_gt:
                 trainer.evaluate(test_loader) # blender has gt, so evaluate it.
@@ -169,7 +183,7 @@ if __name__ == '__main__':
             trainer.save_mesh(resolution=256, threshold=10)
     
     else:
-        train_loader = NeRFDataset(opt, device=device, type='train').dataloader()
+        train_loader = NeRFDataset(opt, device=device, type='train', vae=vae).dataloader()
         model = NeRFNetwork(
             encoding="hashgrid",
             bound=opt.bound,
@@ -180,6 +194,9 @@ if __name__ == '__main__':
             bg_radius=opt.bg_radius,
             aabb_bounds=[opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz],
             sem_out_dim=train_loader._data.num_labels,
+            use_latent=opt.latent,
+            low_res_img=opt.low_res_img,
+            latent_dim=opt.latent_dim
         )
         
         print(model)
@@ -191,23 +208,46 @@ if __name__ == '__main__':
         scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
 
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, criterion_sem=criterion_sem, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=50, save_iter=opt.save_iter)
+        trainer = Trainer(
+            'ngp', opt, model, device=device, workspace=opt.workspace, 
+            optimizer=optimizer, criterion=criterion, criterion_sem=criterion_sem, 
+            ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, 
+            scheduler_update_every_step=True, metrics=metrics, 
+            use_checkpoint=opt.ckpt, eval_interval=50, save_iter=opt.save_iter, 
+            vae=vae
+        )
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer, train_loader)
             gui.render()
         else:
-            valid_loader = NeRFDataset(opt, device=device, type='val', downscale=1).dataloader()
+            val_data = [
+                train_loader._data.poses_verify, 
+                train_loader._data.images_verify,
+                train_loader._data.sem_datas_verify,
+            ]
+            global_iter = 0
+            while global_iter < opt.iters:
+                outputs = trainer.train(train_loader, step=16, val_data=val_data, sem_map_type=opt.sem_mode)
+                global_iter = trainer.global_step
+                print("Step: ", global_iter)
+                for k,v in outputs.items():
+                    print(k, ":", v)
+                print()
+            print("Experiment finished")
 
-            max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
-            trainer.train(train_loader, valid_loader, max_epoch)
 
-            # also test
-            test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
+            # valid_loader = NeRFDataset(opt, device=device, type='val', downscale=1, vae=vae).dataloader()
+
+            # max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
+            # trainer.train(train_loader, valid_loader, max_epoch)
+
+            # # also test
+            # test_loader = NeRFDataset(opt, device=device, type='test', vae=vae).dataloader()
             
-            if test_loader.has_gt:
-                trainer.evaluate(test_loader) # blender has gt, so evaluate it.
+            # if test_loader.has_gt:
+            #     trainer.evaluate(test_loader) # blender has gt, so evaluate it.
             
-            trainer.test(test_loader, write_video=True) # test and save video
+            # trainer.test(test_loader, write_video=True) # test and save video
             
-            trainer.save_mesh(resolution=256, threshold=10)
+            # trainer.save_mesh(resolution=256, threshold=10)

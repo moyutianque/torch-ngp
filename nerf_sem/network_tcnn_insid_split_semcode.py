@@ -3,12 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import numpy as np
-import os
+
 import tinycudann as tcnn
 from activation import trunc_exp
 from .renderer import NeRFRenderer
-from pytorch_tabnet import tab_network
-from sklearn.ensemble import GradientBoostingClassifier
+import os
 
 class NeRFNetwork(NeRFRenderer):
     def __init__(self,
@@ -23,9 +22,6 @@ class NeRFNetwork(NeRFRenderer):
                  num_layers_sem=2,
                  sem_out_dim=3,
                  bound=1,
-                 use_latent=False,
-                 low_res_img=False,
-                 latent_dim=32,
                  **kwargs
                  ):
         super().__init__(bound, **kwargs)
@@ -49,8 +45,21 @@ class NeRFNetwork(NeRFRenderer):
             },
         )
 
+        n_levels_sem = 8
+        per_level_scale_sem = np.exp2(np.log2(2048 * bound / n_levels_sem) / (n_levels_sem - 1))
+        self.encoder_sem = tcnn.Encoding(
+            n_input_dims=3,
+            encoding_config={
+                "otype": "HashGrid",
+                "n_levels": n_levels_sem, # default == 16
+                "n_features_per_level": 2,
+                "log2_hashmap_size": 19,
+                "base_resolution": n_levels_sem,
+                "per_level_scale": per_level_scale_sem,
+            },
+        )
+
         freq = 12
-        print(f"Using frequency position encoding with freq {freq}")
         self.sincos_encoder = tcnn.Encoding(
             n_input_dims=3,
             encoding_config={
@@ -85,98 +94,29 @@ class NeRFNetwork(NeRFRenderer):
 
         self.in_dim_color = self.encoder_dir.n_output_dims + self.geo_feat_dim
 
-        self.use_latent = use_latent
-        self.low_res_img = low_res_img
-
-        self.latent_dim = latent_dim
-        self.latent_proj = nn.Linear(self.latent_dim, 4)
-        
-        if use_latent:
-            self.color_net = tcnn.Network(
-                n_input_dims=self.in_dim_color,
-                n_output_dims=self.latent_dim,
-                network_config={
-                    "otype": "FullyFusedMLP",
-                    "activation": "ReLU",
-                    "output_activation": "None",
-                    "n_neurons": hidden_dim_color,
-                    "n_hidden_layers": num_layers_color - 1,
-                },
-            )
-
-            if self.low_res_img:
-                self.color_net_low_res = tcnn.Network(
-                    n_input_dims=self.in_dim_color,
-                    n_output_dims=3,
-                    network_config={
-                        "otype": "FullyFusedMLP",
-                        "activation": "ReLU",
-                        "output_activation": "None",
-                        "n_neurons": hidden_dim_color,
-                        "n_hidden_layers": num_layers_color - 1,
-                    },
-                )
-
-
-        else:
-            self.color_net = tcnn.Network(
-                n_input_dims=self.in_dim_color,
-                n_output_dims=3,
-                network_config={
-                    "otype": "FullyFusedMLP",
-                    "activation": "ReLU",
-                    "output_activation": "None",
-                    "n_neurons": hidden_dim_color,
-                    "n_hidden_layers": num_layers_color - 1,
-                },
-            )
-
+        self.color_net = tcnn.Network(
+            n_input_dims=self.in_dim_color,
+            n_output_dims=3,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": hidden_dim_color,
+                "n_hidden_layers": num_layers_color - 1,
+            },
+        )
         if os.environ.get('BLOCKSEM', False):
-            if os.environ.get('ONLYCOORD', False):
-                if os.environ.get('TABNET', False):
-                    # self.sem_net = tab_network.TabNet(
-                    #     freq*3*2,
-                    #     sem_out_dim,
-                    #     n_d=8,
-                    #     n_a=8,
-                    #     n_steps=3,
-                    #     gamma=1.3,
-                    #     cat_idxs=[],
-                    #     cat_dims=[],
-                    #     cat_emb_dim=1,
-                    #     n_independent=2,
-                    #     n_shared=2,
-                    #     epsilon=1e-15,
-                    #     virtual_batch_size=128,
-                    #     momentum=0.02,
-                    #     mask_type="sparsemax",
-                    # )
-                    # self.sem_net = GradientBoostingClassifier(n_estimators=100, learning_rate=1e-3, max_depth=5)
-                    raise NotImplementedError()
-                else:
-                    self.sem_net = tcnn.Network(
-                        n_input_dims=freq*3*2,
-                        n_output_dims=sem_out_dim,
-                        network_config={
-                            "otype": "FullyFusedMLP",
-                            "activation": "ReLU",
-                            "output_activation": "None",
-                            "n_neurons": hidden_dim_sem,
-                            "n_hidden_layers": num_layers_sem - 1,
-                        },
-                    )
-            else:
-                self.sem_net = tcnn.Network(
-                    n_input_dims=self.geo_feat_dim + freq*3*2,
-                    n_output_dims=sem_out_dim,
-                    network_config={
-                        "otype": "FullyFusedMLP",
-                        "activation": "ReLU",
-                        "output_activation": "None",
-                        "n_neurons": hidden_dim_sem,
-                        "n_hidden_layers": num_layers_sem - 1,
-                    },
-                )
+            self.sem_net = tcnn.Network(
+                n_input_dims=n_levels_sem*2 + freq*3*2,
+                n_output_dims=sem_out_dim,
+                network_config={
+                    "otype": "FullyFusedMLP",
+                    "activation": "ReLU",
+                    "output_activation": "None",
+                    "n_neurons": hidden_dim_sem,
+                    "n_hidden_layers": num_layers_sem - 1,
+                },
+            )
         else:
             self.sem_net = tcnn.Network(
                 n_input_dims=self.geo_feat_dim,
@@ -192,15 +132,13 @@ class NeRFNetwork(NeRFRenderer):
 
         self.sem_out_dim = sem_out_dim
 
-        # self.relu = nn.ReLU()
+        print("\033[92m [INFO] \033[00m Running in the model of separate hash code")
         self.softplus = nn.Softplus()
     
     def sem_activation(self, x):
         # return torch.nn.functional.softmax(x, dim=-1)
         # return torch.sigmoid(x)
-        # return x
         return self.softplus(x)
-        # return self.relu(x)
        
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
@@ -211,8 +149,11 @@ class NeRFNetwork(NeRFRenderer):
         if os.environ.get('BLOCKSEM', False):
             x_sincos = self.sincos_encoder(x)
 
-        x = self.encoder(x)
-        h = self.sigma_net(x)
+        x_out = self.encoder(x)
+        h = self.sigma_net(x_out)
+        x_out_sem = self.encoder_sem(x)
+        # import ipdb;ipdb.set_trace() # breakpoint 128
+        # h_sem = self.sigma_net(x_out_sem)
 
         # sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
@@ -223,48 +164,34 @@ class NeRFNetwork(NeRFRenderer):
         d = self.encoder_dir(d)
 
         #p = torch.zeros_like(geo_feat[..., :1]) # manual input padding
-        h_cat = torch.cat([d, geo_feat], dim=-1)
-        if self.use_latent and self.low_res_img:
-            h_im = self.color_net_low_res(h_cat)
-        h = self.color_net(h_cat)
+        h = torch.cat([d, geo_feat], dim=-1)
+        h = self.color_net(h)
 
         # NOTE zehao@nov 28 
         if os.environ.get('BLOCKSEM', False):
-            if os.environ.get('ONLYCOORD', False):
-                geo_feat2 = x_sincos.detach()
-            else:
-                geo_feat2 = torch.cat([x_sincos.detach(), geo_feat.detach()], dim=-1)
-            # geo_feat2 = geo_feat.detach()
-            
-            if os.environ.get('TABNET', False):
-                try:
-                    h_sem, M_LOSS = self.sem_net(geo_feat2)
-                    
-                except:
-                    import ipdb;ipdb.set_trace() # breakpoint 202
-                # import ipdb;ipdb.set_trace() # breakpoint 197
-            else:
-                h_sem = self.sem_net(geo_feat2)
+            geo_feat2 = torch.cat([x_sincos, x_out_sem], dim=-1)
+            # h_sem = self.sem_net(x_out_sem)
+            h_sem = self.sem_net(geo_feat2)
         else:
-            h_sem = self.sem_net(geo_feat)
-        
+            h_sem = self.sem_net(h_sem[..., 1:])
+
         # sigmoid activation for rgb
-        if self.use_latent:
-            color_low_res = None
-            if self.low_res_img:
-                color_low_res = torch.sigmoid(h_im)
-            color=h
-            return sigma, color, color_low_res
-        
         color = torch.sigmoid(h)
+        
         sem = self.sem_activation(h_sem)
+        # sem = h_sem
+
         return sigma, color, sem
 
     def density(self, x):
         # x: [N, 3], in [-bound, bound]
+
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
-        x = self.encoder(x)
-        h = self.sigma_net(x)
+        x_out = self.encoder(x)
+        h = self.sigma_net(x_out)
+
+        # x_out_sem = self.encoder_sem(x)
+        # h_sem = self.sigma_net(x_out_sem)
 
         # sigma = F.relu(h[..., 0])
         sigma = trunc_exp(h[..., 0])
@@ -273,11 +200,11 @@ class NeRFNetwork(NeRFRenderer):
         return {
             'sigma': sigma,
             'geo_feat': geo_feat,
+            # 'geo_feat_sem': h_sem[..., 1:]
         }
 
     # allow masked inference
     def color(self, x, d, mask=None, geo_feat=None, **kwargs):
-        import ipdb;ipdb.set_trace() # breakpoint 278
         # x: [N, 3] in [-bound, bound]
         # mask: [N,], bool, indicates where we actually needs to compute rgb.
 
@@ -300,10 +227,7 @@ class NeRFNetwork(NeRFRenderer):
         h = self.color_net(h)
         
         # sigmoid activation for rgb
-        if self.use_latent:
-            h = h
-        else:
-            h = torch.sigmoid(h)
+        h = torch.sigmoid(h)
 
         if mask is not None:
             rgbs[mask] = h.to(rgbs.dtype) # fp16 --> fp32
@@ -312,13 +236,11 @@ class NeRFNetwork(NeRFRenderer):
 
         return rgbs     
 
-    def sem(self, x, mask=None, geo_feat=None, **kwargs):
-        import ipdb;ipdb.set_trace() # breakpoint 211
+    def sem(self, x, mask=None, geo_feat_sem=None, **kwargs):
+        import ipdb;ipdb.set_trace() # breakpoint 223
         # x: [N, 3] in [-bound, bound]
         # mask: [N,], bool, indicates where we actually needs to compute rgb.
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
-        if os.environ.get('BLOCKSEM', False):
-            x_sincos = self.sincos_encoder(x)
 
         if mask is not None:
             sems = torch.zeros(mask.shape[0], self.sem_out_dim, dtype=x.dtype, device=x.device) # [N, sem_out_dim]
@@ -326,16 +248,10 @@ class NeRFNetwork(NeRFRenderer):
             if not mask.any():
                 return sems
             x = x[mask]
-            geo_feat = geo_feat[mask]
+            geo_feat_sem = geo_feat_sem[mask]
 
         # sem
-        if os.environ.get('BLOCKSEM', False):
-            geo_feat2 = torch.cat([x_sincos.detach(), geo_feat.detach()], dim=-1)
-            # geo_feat2 = geo_feat.detach()
-            h_sem = self.sem_net(geo_feat2)
-            h = self.sem_net(h_sem)
-        else:
-            h = self.sem_net(geo_feat)
+        h = self.sem_net(geo_feat_sem)
 
         h = self.sem_activation(h)
         
@@ -355,10 +271,8 @@ class NeRFNetwork(NeRFRenderer):
             {'params': self.encoder_dir.parameters(), 'lr': lr},
             {'params': self.color_net.parameters(), 'lr': lr}, 
             {'params': self.sem_net.parameters(), 'lr': lr},  # NOTE zehao @ Dec 13, forget to add previously
-            {'params': self.latent_proj.parameters(), 'lr': lr}
+            {'params': self.encoder_sem.parameters(), 'lr': lr},  # NOTE zehao @ Jan 24, forget to add previously
         ]
-        if self.low_res_img:
-            params.append({'params': self.color_net_low_res.parameters(), 'lr': lr})
         if self.bg_radius > 0:
             params.append({'params': self.encoder_bg.parameters(), 'lr': lr})
             params.append({'params': self.bg_net.parameters(), 'lr': lr})

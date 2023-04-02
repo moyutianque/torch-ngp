@@ -65,15 +65,15 @@ def run(depth_root):
     
     # file_paths = [file_paths[0], file_paths[40],]
     # cam_poses = [cam_poses[0], cam_poses[40], ]
-    file_paths = [file_paths[64], file_paths[65]]
-    cam_poses = [cam_poses[64],  cam_poses[65]]
-    rgb_paths = [rgb_paths[64],  rgb_paths[65]]
+    # file_paths = [file_paths[64], file_paths[65]]
+    # cam_poses = [cam_poses[64],  cam_poses[65]]
+    # rgb_paths = [rgb_paths[64],  rgb_paths[65]]
     
     # file_paths = [file_paths[63], file_paths[97]]
     # cam_poses = [cam_poses[63], cam_poses[97]]
-    # file_paths = file_paths[::20]
-    # cam_poses = cam_poses[::20]
-    # rgb_paths = rgb_paths[::20]
+    file_paths = file_paths[::20]
+    cam_poses = cam_poses[::20]
+    rgb_paths = rgb_paths[::20]
     # file_paths = [file_paths[0], file_paths[1]]
     # cam_poses = [cam_poses[0], cam_poses[1]]
 

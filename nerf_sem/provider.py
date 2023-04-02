@@ -6,9 +6,9 @@ from cv2 import transform
 import tqdm
 import numpy as np
 from scipy.spatial.transform import Slerp, Rotation
-
+from torchvision import transforms
 import trimesh
-
+import torch.nn.functional as F
 import torch
 from torch.utils.data import DataLoader
 
@@ -94,7 +94,7 @@ def rand_poses(size, device, radius=1, theta_range=[np.pi/3, 2*np.pi/3], phi_ran
 
 
 class NeRFDataset:
-    def __init__(self, opt, device, type='train', downscale=1, n_test=10, val_sample_step=20):
+    def __init__(self, opt, device, type='train', downscale=1, n_test=10, val_sample_step=20, vae=None):
         super().__init__()
         
         self.opt = opt
@@ -104,9 +104,11 @@ class NeRFDataset:
         self.root_path = opt.path
         self.preload = opt.preload # preload data into GPU
         self.scale = opt.scale # camera radius scale to make sure camera are inside the bounding box.
+
         self.offset = opt.offset # camera offset
         self.bound = opt.bound # bounding box half length, also used as the radius to random sample poses.
         self.fp16 = opt.fp16 # if preload, load into fp16.
+        self.vae = vae
 
         self.training = self.type in ['train', 'all', 'trainval']
         self.num_rays = self.opt.num_rays if self.training else -1
@@ -119,9 +121,7 @@ class NeRFDataset:
             transform = json.load(f)
 
         # replica apartment 2 dining room
-        # test_index = [210, 248]
-        # verify_index = [51, 67, 100, 192, 224, 237]
-        test_index = []
+        test_index = [404, 428]
         verify_index = [50,100,150,200,230,300,350,400]
 
         self.test_len = len(test_index)
@@ -135,6 +135,16 @@ class NeRFDataset:
         else:
             # we have to actually read an image to get H and W later.
             self.H = self.W = None
+        
+        if self.opt.latent and self.opt.latent_space == 'original':
+            self.H_ray = int(self.H/8)
+            self.W_ray = int(self.W/8)
+        elif self.opt.low_res_img:
+            self.H_ray = int(self.H/8)
+            self.W_ray = int(self.W/8)
+        else:
+            self.H_ray = self.H 
+            self.W_ray = self.W
         
         # read images
         frames = transform["frames"]
@@ -169,6 +179,7 @@ class NeRFDataset:
 
             self.poses = []
             self.images = []
+            self.latents = []
             self.sem_datas = []
             self.depths = []
             self.sem_label_map = []
@@ -221,6 +232,19 @@ class NeRFDataset:
 
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
+                # NOTE: Mar 22 2023, keep image 3 channel
+                image = image[:,:,:3]
+                latent = None
+                if self.vae is not None:
+                    self.vae.eval()
+                    image_tensor = transforms.ToTensor()(image)
+                    pixel_values = torch.stack([image_tensor])
+                    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+                    with torch.no_grad():
+                        latent = vae.encode(pixel_values.cuda()).latent_dist.mode()
+                        if self.opt.latent_space == 'img_size':
+                            latent = F.interpolate(latent, scale_factor=(8,8), mode='nearest')
+
                 if self.opt.depth_sup:
                     f_path_depth = os.path.join(self.root_path, 'depth', f"{img_idx}.npy")
                     depth_data = np.load(f_path_depth)
@@ -266,6 +290,7 @@ class NeRFDataset:
 
                 self.poses.append(pose)
                 self.images.append(image)
+                self.latents.append(latent)
                 self.sem_datas.append(sem_data)
                 if self.opt.depth_sup:
                     self.depths.append(depth_data)
@@ -277,12 +302,14 @@ class NeRFDataset:
         # Create data splits
         self.poses_train = []
         self.images_train = []
+        self.latent_train = []
         self.depths_train = []
         self.sem_datas_train = []
         self.nearby_views_train = []
 
         self.poses_test = []
         self.images_test = []
+        self.latent_test = []
         self.depths_test = []
         self.sem_datas_test = []
         self.nearby_views_test = []
@@ -305,6 +332,7 @@ class NeRFDataset:
             if k in test_index:
                 self.poses_test.append(self.poses[k])
                 self.images_test.append(self.images[k])
+                self.latent_test.append(self.latents[k])
                 self.sem_datas_test.append(self.sem_datas[k])
                 if self.opt.depth_sup:
                     self.depths_test.append(self.depths[k])
@@ -313,6 +341,7 @@ class NeRFDataset:
             else:
                 self.poses_train.append(self.poses[k])
                 self.images_train.append(self.images[k])
+                self.latent_train.append(self.latents[k])
                 self.sem_datas_train.append(self.sem_datas[k])
                 if self.opt.depth_sup:
                     self.depths_train.append(self.depths[k])
@@ -363,7 +392,6 @@ class NeRFDataset:
 
         # [debug] uncomment to view examples of randomly generated poses.
         # visualize_poses(rand_poses(100, self.device, radius=self.radius).cpu().numpy())
-
         if self.preload:
             self.poses_train = self.poses_train.to(self.device)
             if self.images_train is not None:
@@ -373,6 +401,10 @@ class NeRFDataset:
                 else:
                     dtype = torch.float
                 self.images_train = self.images_train.to(dtype).to(self.device)
+
+                if self.vae is not None:
+                    self.latent_train = torch.cat(self.latent_train, dim=0).to(dtype).to(self.device).permute(0, 2, 3, 1)
+                
                 self.sem_datas_train = self.sem_datas_train.to(dtype).to(self.device)
                 if self.opt.depth_sup:
                     self.depths_train = self.depths_train.to(dtype).to(self.device)
@@ -398,7 +430,10 @@ class NeRFDataset:
         cy = (transform['cy'] / downscale) if 'cy' in transform else (self.H / 2)
     
         self.intrinsics = np.array([fl_x, fl_y, cx, cy])
-    
+
+        if self.opt.latent_space == 'original' or self.opt.low_res_img:
+            self.intrinsics = self.intrinsics/8
+ 
     @property
     def num_labels(self):
         if len(self.target_labels) == 0:
@@ -415,8 +450,8 @@ class NeRFDataset:
             poses = rand_poses(B, self.device, radius=self.radius)
 
             # sample a low-resolution but full image for CLIP
-            s = np.sqrt(self.H * self.W / self.num_rays) # only in training, assert num_rays > 0
-            rH, rW = int(self.H / s), int(self.W / s)
+            s = np.sqrt(self.H_ray * self.W_ray / self.num_rays) # only in training, assert num_rays > 0
+            rH, rW = int(self.H_ray / s), int(self.W_ray / s)
             rays = get_rays(poses, self.intrinsics / s, rH, rW, -1)
 
             return {
@@ -430,60 +465,85 @@ class NeRFDataset:
 
         error_map = None if self.error_map is None else self.error_map[index]
  
-        rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
+        rays = get_rays(poses, self.intrinsics, self.H_ray, self.W_ray, self.num_rays, error_map, self.opt.patch_size)
 
         results = {
-            'H': self.H,
-            'W': self.W,
+            'H': self.H_ray,
+            'W': self.W_ray,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
         }
 
-        if self.images_train is not None:
+        if self.vae is None:
+            if self.images_train is not None:
+                images = self.images_train[index].to(self.device) # [B, H, W, 3/4]
+                if self.opt.low_res_img:
+                    images = images[:, ::8, ::8, :].contiguous()
+
+                if self.training:
+                    C = images.shape[-1]
+                    images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
+                results['images'] = images
+
+            if self.sem_datas_train is not None:
+                sem_datas = self.sem_datas_train[index].to(self.device) # [B, H, W, none/3/4]
+
+                if self.training:
+                    C = sem_datas.shape[-1]
+                    if len(sem_datas.shape) == 3:
+                        sem_datas = torch.gather(sem_datas.view(B, -1), 1, rays['inds']) # [B, N]
+                    else:
+                        sem_datas = torch.gather(sem_datas.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
+                results['images_sem'] = sem_datas 
+            
+            if self.opt.depth_sup:
+                depths = self.depths_train[index].to(self.device) # [B, H, W, none/3/4]
+                depth_radial2plane = self.depth_radial2plane
+
+                if self.training:
+                    C = depths.shape[-1]
+                    depths = torch.gather(depths.view(B, -1), 1, rays['inds'])
+                    depth_radial2plane = torch.gather(depth_radial2plane.view(B, -1), 1, rays['inds'])
+                results['images_depth'] = depths 
+                results['depth_radial2plane'] = depth_radial2plane 
+
+            # need inds to update error_map
+            if error_map is not None:
+                results['index'] = index
+                results['inds_coarse'] = rays['inds_coarse']
+            
+            # NOTE: pad random patch only for depth regularization
+            if self.opt.depth_reg:
+                sample_size = 4
+                rd_poses = rand_poses(sample_size, self.device, radius=self.radius)
+                rd_rays = get_rays(rd_poses, self.intrinsics, self.H_ray, self.W_ray, self.num_rays//2, error_map=None, patch_size=self.opt.patch_size)
+                results.update({'rd_rays_o': rd_rays['rays_o'], 'rd_rays_d': rd_rays['rays_d']})
+                
+        else:
+            latents = self.latent_train[index].to(self.device) # [B, H/8, W/8, 4]
+            if self.training:
+                C = latents.shape[-1]
+                latents = torch.gather(latents.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
+            results['latents'] = latents 
+
             images = self.images_train[index].to(self.device) # [B, H, W, 3/4]
+            images = images[:, ::8, ::8, :].contiguous()
+            if os.environ.get('VIS_PATCH', False):
+                import matplotlib.pyplot as plt
+                for img in images:
+                    plt.imshow(img.cpu().numpy().astype(float))
+                    plt.show()
+            
             if self.training:
                 C = images.shape[-1]
                 images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
             results['images'] = images
 
-        if self.sem_datas_train is not None:
-            sem_datas = self.sem_datas_train[index].to(self.device) # [B, H, W, none/3/4]
-
-            if self.training:
-                C = sem_datas.shape[-1]
-                if len(sem_datas.shape) == 3:
-                    sem_datas = torch.gather(sem_datas.view(B, -1), 1, rays['inds']) # [B, N]
-                else:
-                    sem_datas = torch.gather(sem_datas.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
-            results['images_sem'] = sem_datas 
-        
-        if self.opt.depth_sup:
-            depths = self.depths_train[index].to(self.device) # [B, H, W, none/3/4]
-            depth_radial2plane = self.depth_radial2plane
-
-            if self.training:
-                C = depths.shape[-1]
-                depths = torch.gather(depths.view(B, -1), 1, rays['inds'])
-                depth_radial2plane = torch.gather(depth_radial2plane.view(B, -1), 1, rays['inds'])
-            results['images_depth'] = depths 
-            results['depth_radial2plane'] = depth_radial2plane 
-
-        # need inds to update error_map
-        if error_map is not None:
-            results['index'] = index
-            results['inds_coarse'] = rays['inds_coarse']
-        
-        # NOTE: pad random patch only for depth regularization
-        if self.opt.depth_reg:
-            sample_size = 4
-            rd_poses = rand_poses(sample_size, self.device, radius=self.radius)
-            rd_rays = get_rays(rd_poses, self.intrinsics, self.H, self.W, self.num_rays//2, error_map=None, patch_size=self.opt.patch_size)
-            results.update({'rd_rays_o': rd_rays['rays_o'], 'rd_rays_d': rd_rays['rays_d']})
-            
         return results
 
     def dataloader(self):
-        size = len(self.poses)
+        # size = len(self.poses) # leak test data
+        size = len(self.poses_train)
         if self.training and self.rand_pose > 0:
             size += size // self.rand_pose # index >= size means we use random pose.
         loader = DataLoader(list(range(size)), batch_size=1, collate_fn=self.collate, shuffle=self.training, num_workers=0)

@@ -16,7 +16,8 @@ class OrbitCamera:
         self.radius = 0 # NOTE zehao modified: rotate along frame center
         self.fovy = fovy # in degree
         # self.center = np.array([0, 0, 0], dtype=np.float32) # look at this point
-        self.center = np.array([0, 0, -r], dtype=np.float32) # # NOTE zehao modified camera shift
+        # self.center = np.array([0, 0, -r], dtype=np.float32) # # NOTE zehao modified camera shift
+        self.center = np.array([-0.41, 0, -0.059], dtype=np.float32) # # NOTE zehao modified camera shift
 
         self.rot = R.from_quat([1, 0, 0, 0]) # init camera matrix: [[1, 0, 0], [0, -1, 0], [0, 0, 1]] (to suit ngp convention)
         self.up = np.array([0, 1, 0], dtype=np.float32) # need to be normalized!
@@ -57,7 +58,7 @@ class OrbitCamera:
     
 
 class NeRFGUI:
-    def __init__(self, opt, trainer, train_loader=None, debug=True):
+    def __init__(self, opt, trainer, train_loader=None, debug=True ):
         self.opt = opt # shared with the trainer's opt to support in-place modification of rendering parameters.
         self.W = opt.W
         self.H = opt.H
@@ -65,20 +66,21 @@ class NeRFGUI:
         self.debug = debug
         self.bg_color = torch.ones(3, dtype=torch.float32) # default white bg
         self.training = False
-        self.step = 0 # training step 
+        # self.step = 0 # training step 
+        self.step = trainer.global_step # training step 
         self.global_iter = 0
 
         self.map_res = 1080
 
         self.trainer = trainer
         self.train_loader = train_loader
-        
 
         self.val_data = [
             train_loader._data.poses_verify, 
             train_loader._data.images_verify,
             train_loader._data.sem_datas_verify,
         ]
+
         if self.opt.depth_sup:
             self.val_data += [train_loader._data.depths_datas_verify]
         
@@ -98,7 +100,7 @@ class NeRFGUI:
         else:
             self.sem_map_type = 'id'
 
-        self.dynamic_resolution = True
+        self.dynamic_resolution = False
         self.downscale = 1
         self.train_steps = 16
 
@@ -140,17 +142,24 @@ class NeRFGUI:
             self.train_steps = train_steps
 
     def prepare_buffer(self, outputs):
+        # NOTE: only float64 is supported for visualization
         if self.mode == 'image':
-            return outputs['image']
-        elif self.mode == 'sem':
-            if "rgb" in self.opt.sem_mode:
-                return outputs['sem']
-            else:
-                outputs['sem'] = np.argmax(outputs['sem'], axis=-1).astype(int)
-                out_sem = d3_40_colors_rgb[outputs['sem'] % 40].astype(np.float32)/255.
-                return out_sem
-        else:
-            return np.expand_dims(outputs['depth'], -1).repeat(3, -1)
+            return outputs['image'].astype(np.float64)
+        elif self.mode == 'depth':
+            depth = outputs['depth'].repeat(8, axis=0).repeat(8, axis=1)
+            return np.expand_dims(depth, -1).repeat(3, -1)
+    
+        # if self.mode == 'image':
+        #     return outputs['image']
+        # elif self.mode == 'sem':
+        #     if "rgb" in self.opt.sem_mode:
+        #         return outputs['sem']
+        #     else:
+        #         outputs['sem'] = np.argmax(outputs['sem'], axis=-1).astype(int)
+        #         out_sem = d3_40_colors_rgb[outputs['sem'] % 40].astype(np.float32)/255.
+        #         return out_sem
+        # else:
+        #     return np.expand_dims(outputs['depth'], -1).repeat(3, -1)
 
     
     def test_step(self):
@@ -188,6 +197,7 @@ class NeRFGUI:
             dpg.set_value("_log_cam", str(self.cam.pose[:3, 3]))
             if os.environ.get('DEBUG', False): 
                 print(self.render_buffer.shape)
+            
             dpg.set_value("_texture", self.render_buffer)
 
         

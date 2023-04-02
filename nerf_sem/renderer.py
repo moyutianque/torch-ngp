@@ -1,7 +1,7 @@
 import math
 import trimesh
 import numpy as np
-
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -323,6 +323,191 @@ class NeRFRenderer(nn.Module):
             'dist_loss': dist_loss
         }
 
+    def run_cuda_latent(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, **kwargs):
+        # rays_o, rays_d: [B, N, 3], assumes B == 1
+        # return: latent: [B, N, 4], depth: [B, N]
+        use_low_res_img = kwargs['low_res_img']
+        prefix = rays_o.shape[:-1]
+        rays_o = rays_o.contiguous().view(-1, 3)
+        rays_d = rays_d.contiguous().view(-1, 3)
+
+        N = rays_o.shape[0] # N = B * N, in fact
+        device = rays_o.device
+
+        # pre-calculate near far
+        nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, self.aabb_train if self.training else self.aabb_infer, self.min_near)
+
+        # mix background color
+        bg_color = 1
+        results = {}
+        if self.training:
+            # setup counter
+            counter = self.step_counter[self.local_step % 16]
+            counter.zero_() # set to 0
+            self.local_step += 1
+
+            xyzs, dirs, deltas, rays = raymarching.march_rays_train(rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, counter, self.mean_count, perturb, 128, force_all_rays, dt_gamma, max_steps)
+            
+            sigmas, rgbs, low_res_img = self(xyzs, dirs)
+            sigmas = self.density_scale * sigmas
+
+            # special case for CCNeRF's residual learning
+            if len(sigmas.shape) == 2:
+                raise NotImplementedError()
+            else:
+                if use_low_res_img:
+                    weights_sum, depth, image_low_res = raymarching.composite_rays_train(sigmas, low_res_img, deltas, rays, T_thresh)
+                    image_low_res = image_low_res + (1 - weights_sum).unsqueeze(-1) * bg_color
+                    
+                    weights_sum2, _, image = raymarching.composite_rays_train_sem(sigmas, rgbs, deltas, rays, T_thresh)
+                    image = image + (1 - weights_sum2).unsqueeze(-1) * bg_color
+                    
+                    depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
+                    depth_normalized = depth_normalized.view(*prefix)
+                    depth = depth.view(*prefix)
+                    image = image.view(*prefix, self.latent_dim)
+
+                    image_low_res = image_low_res.view(*prefix, 3)
+                else:
+                    weights_sum, depth, image = raymarching.composite_rays_train_sem(sigmas, rgbs, deltas, rays, T_thresh)
+                    image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+                    
+                    depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
+                    image = image.view(*prefix, self.latent_dim)
+                    depth_normalized = depth_normalized.view(*prefix)
+                    depth = depth.view(*prefix)
+            
+            results['weights_sum'] = weights_sum
+
+        else: 
+            dtype = torch.float32
+            if use_low_res_img:
+                weights_sum = torch.zeros(N, dtype=dtype, device=device)
+                depth = torch.zeros(N, dtype=dtype, device=device)
+                image_low_res = torch.zeros(N, 3, dtype=dtype, device=device)
+                
+                n_alive = N # NOTE: resolution of the GUI W*H
+                rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
+                rays_t = nears.clone() # [N]
+
+                step = 0
+                
+                while step < max_steps:
+                    n_alive = rays_alive.shape[0]
+                    if n_alive <= 0:
+                        break
+
+                    n_step = max(min(N // n_alive, 8), 1)
+
+                    xyzs, dirs, deltas = raymarching.march_rays(
+                        n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, 
+                        self.bound, self.density_bitfield, self.cascade, self.grid_size, 
+                        nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps
+                    )
+
+                    sigmas, _, low_res_rgb = self(xyzs, dirs)
+                    sigmas = self.density_scale * sigmas
+
+                    raymarching.composite_rays(
+                        n_alive, n_step, rays_alive, rays_t, sigmas, low_res_rgb, deltas, 
+                        weights_sum, depth, image_low_res, T_thresh
+                    )
+
+                    rays_alive = rays_alive[rays_alive >= 0]
+                    step += n_step
+
+                image_low_res = image_low_res + (1 - weights_sum).unsqueeze(-1) * bg_color
+
+                depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
+                depth_normalized = depth_normalized.view(*prefix)
+                image_low_res = image_low_res.view(*prefix, 3)
+                depth = depth.view(*prefix)
+
+                weights_sum_tmp = torch.zeros(N, dtype=dtype, device=device)
+                depth_tmp = torch.zeros(N, dtype=dtype, device=device)
+                image = torch.zeros(N, self.latent_dim, dtype=dtype, device=device)
+                n_alive = N # NOTE: resolution of the GUI W*H
+                rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
+                rays_t = nears.clone() # [N]
+
+                step = 0
+                while step < max_steps:
+                    n_alive = rays_alive.shape[0]
+                    if n_alive <= 0:
+                        break
+                    n_step = max(min(N // n_alive, 8), 1)
+
+                    xyzs, dirs, deltas = raymarching.march_rays(
+                        n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, 
+                        self.bound, self.density_bitfield, self.cascade, self.grid_size, 
+                        nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps
+                    )
+
+                    sigmas, rgbs, _ = self(xyzs, dirs)
+                    sigmas = self.density_scale * sigmas
+
+                    # id version
+                    raymarching.composite_rays_sem(
+                        n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, 
+                        weights_sum_tmp, depth_tmp, image, T_thresh, self.latent_dim
+                    )
+
+                    rays_alive = rays_alive[rays_alive >= 0]
+                    step += n_step
+                
+                image = image + (1 - weights_sum_tmp).unsqueeze(-1) * bg_color
+                image = image.view(*prefix, self.latent_dim)
+            else:
+                weights_sum = torch.zeros(N, dtype=dtype, device=device)
+                depth = torch.zeros(N, dtype=dtype, device=device)
+                image = torch.zeros(N, self.latent_dim, dtype=dtype, device=device)
+                
+                n_alive = N # NOTE: resolution of the GUI W*H
+                rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
+                rays_t = nears.clone() # [N]
+                step = 0
+                while step < max_steps:
+                    # count alive rays 
+                    n_alive = rays_alive.shape[0]
+                    # exit loop
+                    if n_alive <= 0:
+                        break
+                    # decide compact_steps
+                    n_step = max(min(N // n_alive, 8), 1)
+
+                    xyzs, dirs, deltas = raymarching.march_rays(
+                        n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, 
+                        self.bound, self.density_bitfield, self.cascade, self.grid_size, 
+                        nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps
+                    )
+
+                    sigmas, rgbs, _ = self(xyzs, dirs)
+                    sigmas = self.density_scale * sigmas
+
+                    raymarching.composite_rays_sem(
+                        n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, 
+                        weights_sum, depth, image, T_thresh, self.latent_dim
+                    ) # use latent dimension 4
+
+                    rays_alive = rays_alive[rays_alive >= 0]
+                    step += n_step
+
+                image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+
+                depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
+                depth_normalized = depth_normalized.view(*prefix)
+                image = image.view(*prefix, self.latent_dim)
+                depth = depth.view(*prefix)
+ 
+        results['depth'] = depth
+        results['depth_normalized'] = depth_normalized
+        results['latent'] = image
+        if use_low_res_img:
+            results['image']=image_low_res
+        results['dist_loss'] = None # NOTE have not implementated in cuda version
+
+        return results
+
 
     def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
@@ -404,7 +589,11 @@ class NeRFRenderer(nn.Module):
                 # weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas2, sems2, deltas2, rays2, T_thresh)
                 # image_sem = image_sem + (1 - weights_sum_sem).unsqueeze(-1) * sem_bg_color
 
-                weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas, sems, deltas, rays, T_thresh)
+                if os.environ.get('BLOCKSEM', False):
+                    weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas.detach(), sems, deltas.detach(), rays.detach(), T_thresh)
+                else:
+                    weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas, sems, deltas, rays, T_thresh)
+
                 image_sem = image_sem + (1 - weights_sum_sem).unsqueeze(-1) * sem_bg_color
 
                 depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
@@ -515,7 +704,7 @@ class NeRFRenderer(nn.Module):
 
                 rays_alive = rays_alive[rays_alive >= 0]
                 step += n_step
-
+            
             image_sem = image_sem + (1 - weights_sum).unsqueeze(-1) * sem_bg_color
             image_sem = image_sem.view(*prefix, self.sem_out_dim)
         
@@ -728,5 +917,18 @@ class NeRFRenderer(nn.Module):
 
         else:
             results = _run(rays_o, rays_d, **kwargs)
+
+        return results
+
+    def render_latent(self, rays_o, rays_d, staged=False, max_ray_batch=4096, **kwargs):
+        self.warmup_iter = kwargs['warmup_iter']
+        self.global_step = kwargs['global_step']
+
+        # rays_o, rays_d: [B, N, 3], assumes B == 1
+        # return: pred_rgb: [B, N, 3]
+
+        _run = self.run_cuda_latent
+        # never stage when cuda_ray
+        results = _run(rays_o, rays_d, **kwargs)
 
         return results

@@ -70,8 +70,8 @@ for i in range(iters):
     optimizer = torch.optim.Adam([w], lr=0.01)
     optimizer.zero_grad()
     
-    loss = dist_loss(w, s) # has checked the equivlence 
-    # loss = eff_distloss(w, m, interval)
+    # loss = dist_loss(w, s) # has checked the equivlence 
+    loss = eff_distloss(w, m, interval)
     loss.backward()
     optimizer.step()
 
@@ -103,4 +103,5 @@ fig.update_layout(
 )
 
 fig.show()
+fig.write_html("out.html")
 

@@ -1,0 +1,3 @@
+{
+    "cmake.sourceDirectory": "${workspaceFolder}/ffmlp/dependencies/cutlass/examples/06_splitK_gemm"
+}

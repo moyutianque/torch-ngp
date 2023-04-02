@@ -504,8 +504,9 @@ class Trainer(object):
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
         
-        if self.opt.latent:
+        if self.vae is not None:
             latents = data['latents']
+            B, N, C = latents.shape
             gt_latents = latents
             bg_color=1
             outputs = self.model.render_latent(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, global_step=self.global_step, **vars(self.opt))
@@ -545,11 +546,25 @@ class Trainer(object):
 
         else:
             images = data['images'] # [B, N, 3/4]
+            gt_sem = data['images_sem']
             if self.opt.depth_sup:
                 gt_depth = data['images_depth']
 
-            bg_color = 1
-            gt_rgb = images
+            B, N, C = images.shape
+
+            if self.opt.color_space == 'linear':
+                images[..., :3] = srgb_to_linear(images[..., :3])
+
+            if C == 3 or self.model.bg_radius > 0:
+                bg_color = 1
+            else:
+                bg_color = torch.rand_like(images[..., :3]) # [N, 3], pixel-wise random.
+
+            if C == 4:
+                gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
+            else:
+                gt_rgb = images
+
 
             outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, global_step=self.global_step, **vars(self.opt))
             # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
@@ -558,6 +573,7 @@ class Trainer(object):
                 outputs_rd = self.model.render(data['rd_rays_o'], data['rd_rays_d'], staged=False, bg_color=torch.rand(3, device=self.device), perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, gloabl_step=self.global_step, **vars(self.opt))
 
             pred_rgb = outputs['image']
+            pred_sem = outputs['image_sem']
             if self.opt.depth_sup:
                 pred_depth = outputs['depth']
             
@@ -567,10 +583,27 @@ class Trainer(object):
                 if not self.opt.radial_depth:
                     pred_depth = pred_depth * data['depth_radial2plane']
                 loss_depth = torch.abs(torch.log(gt_depth)-torch.log(pred_depth))
+                # loss_depth = self.criterion(torch.log(pred_depth), torch.log(gt_depth)) 
                 filtered_idx = (~torch.isinf(loss_depth)) & (~torch.isnan(loss_depth))
                 loss_depth = loss_depth[filtered_idx].mean()
                 print(loss_depth.item())
                 # loss_depth = self.criterion(pred_depth, gt_depth).mean()
+
+            # MSE loss
+            loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
+
+            # NOTE: zehao sem loss
+            if len(gt_sem.shape) == 2:
+                gt_sem = gt_sem.view(-1).long()
+                pred_sem = pred_sem.view(len(gt_sem), -1)
+                mask = gt_sem==0
+                loss_sem = self.criterion_sem(pred_sem[~mask], gt_sem[~mask]) # mask empty gt
+            else:
+                loss_sem = self.criterion_sem(pred_sem, gt_sem).mean(-1)
+
+            loss_dist = None
+            if self.opt.distortion_loss:
+                loss_dist = outputs['dist_loss']
 
             # NOTE by zehao, default this is not called
             # # patch-based rendering
@@ -578,6 +611,8 @@ class Trainer(object):
             if self.opt.patch_size > 1: 
                 gt_rgb = gt_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
                 pred_rgb = pred_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
+                gt_sem = gt_sem.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
+                pred_sem = pred_sem.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
 
                 pred_depth = outputs['depth'].view(-1, self.opt.patch_size, self.opt.patch_size)
                 if self.opt.depth_reg:
@@ -585,24 +620,22 @@ class Trainer(object):
                     if outputs_rd is not None:
                         pred_depth2 = outputs_rd['depth'].view(-1, self.opt.patch_size, self.opt.patch_size)
                         loss_ds += depth_reg(pred_depth2)
-                        
-                if os.environ.get('VIS_PATCH', False):
-                    import matplotlib.pyplot as plt
-                    for patch, patch_gt in zip(pred_rgb, gt_rgb):
-                        im_p = patch.detach().cpu().permute(1,2,0).numpy().astype(float)
-                        im_gt = patch_gt.detach().cpu().permute(1,2,0).numpy().astype(float)
-                        plt.imshow(np.concatenate((np.clip(im_p, 0, 1), np.clip(im_gt, 0, 1)), axis=1))
-                        plt.show()
-                loss = self.criterion(pred_rgb, gt_rgb).mean((1,2,3))
-            else:
-                # MSE loss
-                loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
 
             loss_rgb = loss.mean()
+            if len(loss_sem) > 0:
+                loss_sem = loss_sem.mean()
+            else:
+                loss_sem = None
 
+            # extra loss
+            # pred_weights_sum = outputs['weights_sum'] + 1e-8
+            # loss_ws = - 1e-1 * pred_weights_sum * torch.log(pred_weights_sum) # entropy to encourage weights_sum to be 0 or 1.
+            # loss = loss + loss_ws.mean()
             loss = {
                 'loss_rgb': loss_rgb,
                 "loss_depth": loss_depth,
+                'loss_sem': loss_sem,
+                'loss_dist': loss_dist,
                 'loss_ds': loss_ds
             }
 
@@ -1199,6 +1232,11 @@ class Trainer(object):
                 preds_sem = F.interpolate(preds_sem.permute(0, 3, 1, 2), size=(H, W), mode='nearest').permute(0, 2, 3, 1).contiguous()
                 preds_depth = F.interpolate(preds_depth.unsqueeze(1), size=(H, W), mode='nearest').squeeze(1)
 
+        if self.opt.color_space == 'linear':
+            preds = linear_to_srgb(preds)
+            preds_sem = linear_to_srgb(preds_sem)
+            print("[warning] color mode might be wrong")
+
         pred = preds[0].detach().cpu().numpy()
         pred_depth = preds_depth[0].detach().cpu().numpy()
         preds_depth_ori = preds_depth_ori[0].detach().cpu().numpy()
@@ -1211,9 +1249,11 @@ class Trainer(object):
             return outputs
     
         else:
+            preds_sem = preds_sem[0].detach().cpu().numpy()
             outputs = {
                 'image': pred,
                 'depth': pred_depth,
+                'sem': preds_sem,
                 'depth_ori': preds_depth_ori
             }
 

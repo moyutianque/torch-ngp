@@ -1,10 +1,7 @@
 import open3d as o3d
-import jsonlines
 import os.path as osp
 import numpy as np
 import json
-from habitat_sim.utils.common import quat_to_magnum
-import quaternion
 import cv2
 import matplotlib.pyplot as plt
 
@@ -69,9 +66,9 @@ def run(depth_root):
     
     # file_paths = [file_paths[63], file_paths[97]]
     # cam_poses = [cam_poses[63], cam_poses[97]]
-    file_paths = file_paths[::20]
-    cam_poses = cam_poses[::20]
-    rgb_paths = rgb_paths[::20]
+    file_paths = file_paths[::10]
+    cam_poses = cam_poses[::10]
+    rgb_paths = rgb_paths[::10]
     # file_paths = [file_paths[0], file_paths[1]]
     # cam_poses = [cam_poses[0], cam_poses[1]]
 
