@@ -151,10 +151,10 @@ def post_processing(up=None):
         avglen += np.linalg.norm(f["transform_matrix"][0:3,3])
     avglen /= nframes
     print("avg camera distance from origin", avglen)
-    p1, p2 = np.copy(out["frames"][0]["transform_matrix"][0:3,3]), np.copy(out["frames"][200]["transform_matrix"][0:3,3])
+    p1, p2 = np.copy(out["frames"][0]["transform_matrix"][0:3,3]), np.copy(out["frames"][70]["transform_matrix"][0:3,3])
     for f in out["frames"]:
         f["transform_matrix"][0:3,3] *= camera_scale_factor / avglen # scale to "nerf sized"
-    p11, p21 = out["frames"][0]["transform_matrix"][0:3,3], out["frames"][200]["transform_matrix"][0:3,3]
+    p11, p21 = out["frames"][0]["transform_matrix"][0:3,3], out["frames"][70]["transform_matrix"][0:3,3]
     
     # Verify scaling factor
     from scipy.spatial.distance import euclidean

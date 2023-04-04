@@ -123,6 +123,8 @@ class NeRFDataset:
         # replica apartment 2 dining room
         test_index = [404, 428]
         verify_index = [50,100,150,200,230,300,350,400]
+        test_index = [70, 72]
+        verify_index = [10,25,50,60]
 
         self.test_len = len(test_index)
 
@@ -471,6 +473,7 @@ class NeRFDataset:
             'W': self.W_ray,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
+            'pixel_space_inds': rays['pixel_space_inds']
         }
 
         if self.vae is None:
@@ -525,7 +528,9 @@ class NeRFDataset:
                 latents = torch.gather(latents.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
             results['latents'] = latents 
 
+            results['images_raw'] = self.images_train[index]
             images = self.images_train[index].to(self.device) # [B, H, W, 3/4]
+            
             images = images[:, ::8, ::8, :].contiguous()
             if os.environ.get('VIS_PATCH', False):
                 import matplotlib.pyplot as plt

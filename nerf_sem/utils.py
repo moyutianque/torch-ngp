@@ -91,6 +91,7 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
     j = j.t().reshape([1, H*W]).expand([B, H*W]) + 0.5
 
     results = {}
+    results['pixel_space_inds'] =None
     if N > 0:
         N = min(N, H*W)
 
@@ -103,6 +104,7 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
             inds_x = torch.randint(0, H - patch_size, size=[num_patch], device=device)
             inds_y = torch.randint(0, W - patch_size, size=[num_patch], device=device)
             inds = torch.stack([inds_x, inds_y], dim=-1) # [np, 2]
+            results['pixel_space_inds'] = inds
 
             # create meshgrid for each patch
             pi, pj = custom_meshgrid(torch.arange(patch_size, device=device), torch.arange(patch_size, device=device))
@@ -413,6 +415,11 @@ class Trainer(object):
             self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam
         else:
             self.optimizer = optimizer(self.model)
+        
+        if os.environ.get('DEBUG_fixed_decoder', False):
+            from .UNet import PatchFeaUNet
+            self.conv = PatchFeaUNet(32, 3).cuda()
+            self.optimizer.add_param_group({'params': self.conv.parameters(), 'lr': 1e-4})
 
         if lr_scheduler is None:
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
@@ -519,14 +526,34 @@ class Trainer(object):
                     gt_latents = gt_latents.view(-1, self.opt.patch_size, self.opt.patch_size, 4).permute(0, 3, 1, 2).contiguous()
                     pred_latent = pred_latent.view(-1, self.opt.patch_size, self.opt.patch_size, 4).permute(0, 3, 1, 2).contiguous()
 
+                    pixel_patch_idx = data['pixel_space_inds']
+                    pixel_patch_idx = pixel_patch_idx * 8
+                    p_size = self.opt.patch_size * 8
+                    
+                    if self.opt.train_decoder:
+                        self.vae.train()
+                    
                     pred_rgb = self.vae.decode(pred_latent).sample
-                    gt_rgb = self.vae.decode(gt_latents).sample
+
+                    images_raw = data['images_raw'][0]
+                    gt_rgb = []
+                    for p in pixel_patch_idx:
+                        gt_rgb.append(images_raw[
+                                p[0]: p[0]+p_size, 
+                                p[1]: p[1]+p_size, 
+                                :
+                            ].permute(2, 0, 1)
+                        )
+                    gt_rgb = torch.stack(gt_rgb)
+                    
                     if os.environ.get('VIS_PATCH', False):
                         import matplotlib.pyplot as plt
-                        for patch, patch_gt in zip(pred_rgb, gt_rgb):
+                        gt_rgb_vae = self.vae.decode(gt_latents).sample
+                        for patch, patch_gt, patch_gt_vae in zip(pred_rgb, gt_rgb, gt_rgb_vae):
                             im_p = patch.detach().cpu().permute(1,2,0).numpy().astype(float)
                             im_gt = patch_gt.detach().cpu().permute(1,2,0).numpy().astype(float)
-                            plt.imshow(np.concatenate((np.clip(im_p, 0, 1), np.clip(im_gt, 0, 1)), axis=1))
+                            im_gt2 = patch_gt_vae.detach().cpu().permute(1,2,0).numpy().astype(float)
+                            plt.imshow(np.concatenate((np.clip(im_p, 0, 1), np.clip(im_gt, 0, 1), np.clip(im_gt2, 0, 1), np.clip(im_gt2-im_gt, 0, 1)), axis=1))
                             plt.show()
                     # loss = self.criterion(pred_latent, gt_latents).mean((2,3))
                     loss = self.criterion(pred_rgb, gt_rgb).mean((1,2,3))
@@ -551,7 +578,12 @@ class Trainer(object):
             bg_color = 1
             gt_rgb = images
 
-            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, global_step=self.global_step, **vars(self.opt))
+            if os.environ.get('DEBUG_fixed_decoder', False):
+                outputs = self.model.render_latent(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, global_step=self.global_step, **vars(self.opt))
+                outputs['image'] = outputs['latent']
+            else:
+                outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, global_step=self.global_step, **vars(self.opt))
+
             # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
             outputs_rd = None
             if 'rd_rays_o' in data:
@@ -577,7 +609,14 @@ class Trainer(object):
             loss_ds = None
             if self.opt.patch_size > 1: 
                 gt_rgb = gt_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
-                pred_rgb = pred_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
+                
+                if os.environ.get('DEBUG_fixed_decoder', False):
+                    pred_rgb = pred_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 32).permute(0, 3, 1, 2).contiguous()
+                else:
+                    pred_rgb = pred_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
+                
+                if os.environ.get('DEBUG_fixed_decoder', False):
+                    pred_rgb = self.conv(pred_rgb)
 
                 pred_depth = outputs['depth'].view(-1, self.opt.patch_size, self.opt.patch_size)
                 if self.opt.depth_reg:
@@ -666,8 +705,20 @@ class Trainer(object):
                 pred_depth_normalized = outputs['depth'].reshape(-1, H, W)
             return pred_rgb, pred_depth_normalized, None, pred_depth
         else:
-            outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, global_step=self.global_step, **vars(self.opt))
-            pred_rgb = outputs['image'].reshape(-1, H, W, 3)
+            if os.environ.get('DEBUG_fixed_decoder', False):
+                outputs = self.model.render_latent(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, global_step=self.global_step, **vars(self.opt))
+                outputs['image'] = outputs['latent']
+            else:
+                outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, global_step=self.global_step, **vars(self.opt))
+
+            if os.environ.get('DEBUG_fixed_decoder', False):
+                pred_rgb = outputs['image'].reshape(-1, H, W, 32)
+            else:
+                pred_rgb = outputs['image'].reshape(-1, H, W, 3)
+
+            if os.environ.get('DEBUG_fixed_decoder', False):
+                pred_rgb = self.conv(pred_rgb.permute(0,3,1,2)).permute(0,2,3,1)
+
             pred_depth_normalized=None
             if 'depth_normalized' in outputs:
                 pred_depth_normalized = outputs['depth_normalized'].reshape(-1, H, W)
@@ -675,6 +726,9 @@ class Trainer(object):
             else:
                 pred_depth_normalized = outputs['depth'].reshape(-1, H, W)
 
+            if os.environ.get('DEBUG_fixed_decoder', False):
+                return pred_rgb, pred_depth_normalized, None, pred_depth
+            
             pred_sem = outputs['image_sem'].reshape(-1, H, W, self.model.sem_out_dim)
 
             return pred_rgb, pred_depth_normalized, pred_sem, pred_depth
@@ -1196,7 +1250,10 @@ class Trainer(object):
             # TODO: have to permute twice with torch...
             preds = F.interpolate(preds.permute(0, 3, 1, 2), size=(H, W), mode='nearest').permute(0, 2, 3, 1).contiguous()
             if self.vae is None:
-                preds_sem = F.interpolate(preds_sem.permute(0, 3, 1, 2), size=(H, W), mode='nearest').permute(0, 2, 3, 1).contiguous()
+                if os.environ.get('DEBUG_fixed_decoder', False):
+                    pass
+                else:
+                    preds_sem = F.interpolate(preds_sem.permute(0, 3, 1, 2), size=(H, W), mode='nearest').permute(0, 2, 3, 1).contiguous()
                 preds_depth = F.interpolate(preds_depth.unsqueeze(1), size=(H, W), mode='nearest').squeeze(1)
 
         pred = preds[0].detach().cpu().numpy()

@@ -4,4 +4,4 @@ python viewer_simple.py --scene $scene_path --dataset ./ui_data/mp3d.scene_datas
 # python viewer.py --scene $scene_path --dataset ./ui_data/mp3d.scene_dataset_config.json
 
 # echo "START transforming to nerf used data format"
-# python ../convert_poses.py
+python ../convert_poses.py

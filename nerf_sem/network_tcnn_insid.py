@@ -119,17 +119,30 @@ class NeRFNetwork(NeRFRenderer):
 
 
         else:
-            self.color_net = tcnn.Network(
-                n_input_dims=self.in_dim_color,
-                n_output_dims=3,
-                network_config={
-                    "otype": "FullyFusedMLP",
-                    "activation": "ReLU",
-                    "output_activation": "None",
-                    "n_neurons": hidden_dim_color,
-                    "n_hidden_layers": num_layers_color - 1,
-                },
-            )
+            if os.environ.get('DEBUG_fixed_decoder', False):
+                self.color_net = tcnn.Network(
+                    n_input_dims=self.in_dim_color,
+                    n_output_dims=32,
+                    network_config={
+                        "otype": "FullyFusedMLP",
+                        "activation": "ReLU",
+                        "output_activation": "None",
+                        "n_neurons": hidden_dim_color,
+                        "n_hidden_layers": num_layers_color - 1,
+                    },
+                )
+            else:
+                self.color_net = tcnn.Network(
+                    n_input_dims=self.in_dim_color,
+                    n_output_dims=3,
+                    network_config={
+                        "otype": "FullyFusedMLP",
+                        "activation": "ReLU",
+                        "output_activation": "None",
+                        "n_neurons": hidden_dim_color,
+                        "n_hidden_layers": num_layers_color - 1,
+                    },
+                )
 
         if os.environ.get('BLOCKSEM', False):
             if os.environ.get('ONLYCOORD', False):
@@ -256,7 +269,10 @@ class NeRFNetwork(NeRFRenderer):
             color=h
             return sigma, color, color_low_res
         
-        color = torch.sigmoid(h)
+        if os.environ.get('DEBUG_fixed_decoder', False):
+            color=h
+        else:
+            color = torch.sigmoid(h)
         sem = self.sem_activation(h_sem)
         return sigma, color, sem
 

@@ -88,6 +88,7 @@ if __name__ == '__main__':
     parser.add_argument('--latent_space', choices=['original', 'img_size'], default='original', type=str)
     parser.add_argument('--latent_dim', type=int, default=4, help="latent dimt")
     parser.add_argument('--low_res_img', action='store_true', help="latent nerf with low res image")
+    parser.add_argument('--train_decoder', action='store_true', help="train the decoder")
 
     opt = parser.parse_args()
 
@@ -201,7 +202,10 @@ if __name__ == '__main__':
         
         print(model)
 
-        optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
+        if opt.train_decoder:
+            optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr) + [{'params': vae.parameters(), 'lr': opt.lr * 0.001}], betas=(0.9, 0.99), eps=1e-15)
+        else:
+            optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
         # optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15, weight_decay=1e-5) # NOTE zehao add L2 normalization on weights
 
         # decay to 0.1 * init_lr at last iter step
