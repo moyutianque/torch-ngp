@@ -1,63 +1,12 @@
 import math
-import trimesh
-import numpy as np
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 import raymarching
 from .utils import custom_meshgrid
-from torch_efficient_distloss import eff_distloss
-
-def sample_pdf(bins, weights, n_samples, det=False):
-    # This implementation is from NeRF
-    # bins: [B, T], old_z_vals
-    # weights: [B, T - 1], bin weights.
-    # return: [B, n_samples], new_z_vals
-
-    # Get pdf
-    weights = weights + 1e-5  # prevent nans
-    pdf = weights / torch.sum(weights, -1, keepdim=True)
-    cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
-    # Take uniform samples
-    if det:
-        u = torch.linspace(0. + 0.5 / n_samples, 1. - 0.5 / n_samples, steps=n_samples).to(weights.device)
-        u = u.expand(list(cdf.shape[:-1]) + [n_samples])
-    else:
-        u = torch.rand(list(cdf.shape[:-1]) + [n_samples]).to(weights.device)
-
-    # Invert CDF
-    u = u.contiguous()
-    inds = torch.searchsorted(cdf, u, right=True)
-    below = torch.max(torch.zeros_like(inds - 1), inds - 1)
-    above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
-    inds_g = torch.stack([below, above], -1)  # (B, n_samples, 2)
-
-    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
-    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
-    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
-
-    denom = (cdf_g[..., 1] - cdf_g[..., 0])
-    denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
-    t = (u - cdf_g[..., 0]) / denom
-    samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
-
-    return samples
+import numpy as np
 
 
-def plot_pointcloud(pc, color=None):
-    # pc: [N, 3]
-    # color: [N, 3/4]
-    print('[visualize points]', pc.shape, pc.dtype, pc.min(0), pc.max(0))
-    pc = trimesh.PointCloud(pc, color)
-    # axis
-    axes = trimesh.creation.axis(axis_length=4)
-    # sphere
-    sphere = trimesh.creation.icosphere(radius=1)
-    trimesh.Scene([pc, axes, sphere]).show()
-    
 def dist_loss(w, t):
     # transfered from jax code of mip nerf 360
     ut = (t[..., 1:] + t[..., :-1]) / 2
@@ -66,7 +15,6 @@ def dist_loss(w, t):
     loss_intra = torch.sum(w**2 * (t[..., 1:] - t[..., :-1]), dim=-1) / 3
 
     return loss_inter + loss_intra
-
 
 class NeRFRenderer(nn.Module):
     def __init__(self,
@@ -140,193 +88,58 @@ class NeRFRenderer(nn.Module):
         self.mean_count = 0
         self.local_step = 0
 
-    def run(self, rays_o, rays_d, num_steps=128, upsample_steps=128, bg_color=None, perturb=False, **kwargs):
-        # rays_o, rays_d: [B, N, 3], assumes B == 1
-        # bg_color: [3] in range [0, 1]
-        # return: image: [B, N, 3], depth: [B, N]
-
-        prefix = rays_o.shape[:-1]
-        rays_o = rays_o.contiguous().view(-1, 3)
-        rays_d = rays_d.contiguous().view(-1, 3)
-
-        N = rays_o.shape[0] # N = B * N, in fact
-        device = rays_o.device
-
-        # choose aabb
-        aabb = self.aabb_train if self.training else self.aabb_infer
-
-        # sample steps
-        nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, aabb, self.min_near)
-        nears.unsqueeze_(-1)
-        fars.unsqueeze_(-1)
-
-        #print(f'nears = {nears.min().item()} ~ {nears.max().item()}, fars = {fars.min().item()} ~ {fars.max().item()}')
-
-        z_vals = torch.linspace(0.0, 1.0, num_steps, device=device).unsqueeze(0) # [1, T]
-        z_vals = z_vals.expand((N, num_steps)) # [N, T]
-        z_vals = nears + (fars - nears) * z_vals # [N, T], in [nears, fars]
-
-        # perturb z_vals
-        sample_dist = (fars - nears) / num_steps
-        if perturb:
-            z_vals = z_vals + (torch.rand(z_vals.shape, device=device) - 0.5) * sample_dist
-            #z_vals = z_vals.clamp(nears, fars) # avoid out of bounds xyzs.
-
-        # generate xyzs
-        xyzs = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * z_vals.unsqueeze(-1) # [N, 1, 3] * [N, T, 1] -> [N, T, 3]
-        xyzs = torch.min(torch.max(xyzs, aabb[:3]), aabb[3:]) # a manual clip.
-
-        #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
-
-        # query SDF and RGB
-        density_outputs = self.density(xyzs.reshape(-1, 3))
-
-        #sigmas = density_outputs['sigma'].view(N, num_steps) # [N, T]
-        for k, v in density_outputs.items():
-            density_outputs[k] = v.view(N, num_steps, -1)
-
-        # upsample z_vals (nerf-like)
-        if upsample_steps > 0:
-            with torch.no_grad():
-
-                deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T-1]
-                deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
-
-                alphas = 1 - torch.exp(-deltas * self.density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T]
-                alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+1]
-                weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T]
-
-                # sample new z_vals
-                z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1]) # [N, T-1]
-                new_z_vals = sample_pdf(z_vals_mid, weights[:, 1:-1], upsample_steps, det=not self.training).detach() # [N, t]
-
-                new_xyzs = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * new_z_vals.unsqueeze(-1) # [N, 1, 3] * [N, t, 1] -> [N, t, 3]
-                new_xyzs = torch.min(torch.max(new_xyzs, aabb[:3]), aabb[3:]) # a manual clip.
-
-            # only forward new points to save computation
-            new_density_outputs = self.density(new_xyzs.reshape(-1, 3))
-            #new_sigmas = new_density_outputs['sigma'].view(N, upsample_steps) # [N, t]
-            for k, v in new_density_outputs.items():
-                new_density_outputs[k] = v.view(N, upsample_steps, -1)
-
-            # re-order
-            z_vals = torch.cat([z_vals, new_z_vals], dim=1) # [N, T+t]
-            z_vals, z_index = torch.sort(z_vals, dim=1)
-
-            xyzs = torch.cat([xyzs, new_xyzs], dim=1) # [N, T+t, 3]
-            xyzs = torch.gather(xyzs, dim=1, index=z_index.unsqueeze(-1).expand_as(xyzs))
-
-            for k in density_outputs:
-                tmp_output = torch.cat([density_outputs[k], new_density_outputs[k]], dim=1)
-                density_outputs[k] = torch.gather(tmp_output, dim=1, index=z_index.unsqueeze(-1).expand_as(tmp_output))
-
+    def infer_rays(self, prefix, tensor_dim, out_idx, rays_o, rays_d, nears, fars, N, max_steps, device, perturb, dt_gamma, T_thresh):
+        dtype = torch.float32
+        weights_sum = torch.zeros(N, dtype=dtype, device=device)
+        depth = torch.zeros(N, dtype=dtype, device=device)
+        image = torch.zeros(N, tensor_dim, dtype=dtype, device=device)
         
-        deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T+t-1]
-        deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
-        alphas = 1 - torch.exp(-deltas * self.density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T+t]
-        alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+t+1]
-        weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T+t]
-        
-        # normalized_z_vals = nn.functional.normalize(z_vals, dim=1)
-        # deltas2 = normalized_z_vals[..., 1:] - normalized_z_vals[..., :-1] # [N, T+t-1]
-        # deltas2 = torch.cat([deltas2, sample_dist * torch.ones_like(deltas2[..., :1])], dim=-1)
-        # deltas2 = 1 - torch.exp(-deltas2 * self.density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T+t]
-        # weights2 = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T+t]
-        
-        # NOTE: for distortion loss
-        # z_vals_mid = (normalized_z_vals[..., :-1] + 0.5 * deltas2[..., :-1]) # [N, T+t-1]
-        # interval = 1/z_vals_mid.shape[1]
+        n_alive = N
+        rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
+        rays_t = nears.clone() # [N]
+        step = 0
+        while step < max_steps:
+            # count alive rays 
+            n_alive = rays_alive.shape[0]
+            # exit loop
+            if n_alive <= 0:
+                break
+            # decide compact_steps
+            n_step = max(min(N // n_alive, 8), 1)
 
-        dirs = rays_d.view(-1, 1, 3).expand_as(xyzs)
-        for k, v in density_outputs.items():
-            density_outputs[k] = v.view(-1, v.shape[-1])
+            xyzs, dirs, deltas = raymarching.march_rays(
+                n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, 
+                self.bound, self.density_bitfield, self.cascade, self.grid_size, 
+                nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps
+            )
 
-        mask = weights > 1e-4 # hard coded
-        rgbs = self.color(xyzs.reshape(-1, 3), dirs.reshape(-1, 3), mask=mask.reshape(-1), **density_outputs)
-        rgbs = rgbs.view(N, -1, 3) # [N, T+t, 3]
+            sigmas, rgbs, extra_outs = self(xyzs, dirs)
+            if out_idx == -1:
+                process_tensor = rgbs
+            else:
+                process_tensor = extra_outs[out_idx]
 
-        #print(xyzs.shape, 'valid_rgb:', mask.sum().item())
-        # dist_loss = 0.05* eff_distloss(weights2[:, 1:], z_vals_mid, interval) # 360 distortion loss
-        dist_loss = None
+            sigmas = self.density_scale * sigmas
 
-        # calculate weight_sum (mask)
-        weights_sum = weights.sum(dim=-1) # [N]
-        
-        # calculate depth 
-        if not self.training:
-            ori_z_vals = ((z_vals - nears) / (fars - nears)).clamp(0, 1)
-            depth = torch.sum(weights * ori_z_vals, dim=-1)
-        else:
-            # NOTE: use exact depth val
-            depth = torch.sum(weights * z_vals, dim=-1)
+            raymarching.composite_rays_sem(
+                n_alive, n_step, rays_alive, rays_t, sigmas, process_tensor, deltas, 
+                weights_sum, depth, image, T_thresh, tensor_dim
+            ) # use latent dimension 4
 
+            rays_alive = rays_alive[rays_alive >= 0]
+            step += n_step
 
-        # calculate color
-        image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 100], in [0, 1]
+        image = image + (1 - weights_sum).unsqueeze(-1) * 1
 
-        # calculate sem
-        mask_sem = mask
-        # NOTE zehao: this is a temporal implimentation of depth clamp for sem rendering
-        # if self.training and (self.global_step > self.warmup_iter):
-        #     print(depth)
-        #     tolerance = 0.2
-        #     with torch.no_grad():
-        #         index = (torch.clamp(depth.detach()+ tolerance, nears.squeeze(), fars.squeeze()) /sample_dist.squeeze()).long()
-        #         mask_sem = z_vals <= z_vals[index]
-        rgbs_sem = self.sem(xyzs.reshape(-1, 3), mask=mask_sem.reshape(-1), **density_outputs)
-        rgbs_sem = rgbs_sem.view(N, -1, self.sem_out_dim) # [N, T+t, self.sem_out_dim]
-
-        # NOTE: distortion loss for each semantic channel (instance level) not include normalization
-        if self.training:
-            z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1]) # [N, T-1]
-            interval = 1/z_vals_mid.shape[1] * (2*self.bound)
-            dist_loss = 0
-            distloss_w = 0.001
-            for c_idx in range(rgbs_sem.shape[-1]):
-                if c_idx == 0:
-                    continue
-                w =  rgbs_sem[:,:-1, c_idx] / (rgbs_sem[:,:-1, c_idx].sum(-1, keepdim=True).detach() + 1e-7)
-                # w =  rgbs_sem[:,:-1, c_idx]
-                dist_loss += distloss_w * eff_distloss(w, z_vals_mid, interval) # 360 distortion loss
-            
-        image_sem = torch.sum(weights.unsqueeze(-1) * rgbs_sem, dim=-2) # [N, self.sem_out_dim], in [0, 1]
-
-        # mix background color
-        if self.bg_radius > 0:
-            # use the bg model to calculate bg_color
-            sph = raymarching.sph_from_ray(rays_o, rays_d, self.bg_radius) # [N, 2] in [-1, 1]
-            bg_color = self.background(sph, rays_d.reshape(-1, 3)) # [N, 3]
-        elif bg_color is None:
-            bg_color = 1
-
-        # sem_bg_color = torch.zeros(self.sem_out_dim, device=device) # [sem_out_dim]
-        sem_bg_color=1
-
-        image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
-        image = image.view(*prefix, 3)
-
-        image_sem = image_sem + (1 - weights_sum).unsqueeze(-1) * sem_bg_color
-        image_sem = image_sem.view(*prefix, self.sem_out_dim)
-
+        depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
+        depth_normalized = depth_normalized.view(*prefix)
+        image = image.view(*prefix, tensor_dim)
         depth = depth.view(*prefix)
-
-        # tmp: reg loss in mip-nerf 360
-        # z_vals_shifted = torch.cat([z_vals[..., 1:], sample_dist * torch.ones_like(z_vals[..., :1])], dim=-1)
-        # mid_zs = (z_vals + z_vals_shifted) / 2 # [N, T]
-        # loss_dist = (torch.abs(mid_zs.unsqueeze(1) - mid_zs.unsqueeze(2)) * (weights.unsqueeze(1) * weights.unsqueeze(2))).sum() + 1/3 * ((z_vals_shifted - z_vals_shifted) * (weights ** 2)).sum()
-
-        return {
-            'depth': depth,
-            'image': image,
-            'image_sem': image_sem,
-            'weights_sum': weights_sum,
-            'dist_loss': dist_loss
-        }
-
-    def run_cuda_latent(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, **kwargs):
+        return image, depth, depth_normalized
+           
+    def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, extra_out_infos=[], **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # return: latent: [B, N, 4], depth: [B, N]
-        use_low_res_img = kwargs['low_res_img']
         prefix = rays_o.shape[:-1]
         rays_o = rays_o.contiguous().view(-1, 3)
         rays_d = rays_d.contiguous().view(-1, 3)
@@ -348,439 +161,43 @@ class NeRFRenderer(nn.Module):
 
             xyzs, dirs, deltas, rays = raymarching.march_rays_train(rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, counter, self.mean_count, perturb, 128, force_all_rays, dt_gamma, max_steps)
             
-            sigmas, rgbs, low_res_img = self(xyzs, dirs)
+            sigmas, rgbs, extra_outs = self(xyzs, dirs)
             sigmas = self.density_scale * sigmas
 
-            # special case for CCNeRF's residual learning
-            if len(sigmas.shape) == 2:
-                raise NotImplementedError()
-            else:
-                if use_low_res_img:
-                    weights_sum, depth, image_low_res = raymarching.composite_rays_train(sigmas, low_res_img, deltas, rays, T_thresh)
-                    image_low_res = image_low_res + (1 - weights_sum).unsqueeze(-1) * bg_color
-                    
-                    weights_sum2, _, image = raymarching.composite_rays_train_sem(sigmas, rgbs, deltas, rays, T_thresh)
-                    image = image + (1 - weights_sum2).unsqueeze(-1) * bg_color
-                    
-                    depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
-                    depth_normalized = depth_normalized.view(*prefix)
-                    depth = depth.view(*prefix)
-                    image = image.view(*prefix, self.latent_dim)
+            # ray intergral
+            weights_sum, depth, image = raymarching.composite_rays_train_sem(sigmas, rgbs, deltas, rays, T_thresh)
+            image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
 
-                    image_low_res = image_low_res.view(*prefix, 3)
-                else:
-                    weights_sum, depth, image = raymarching.composite_rays_train_sem(sigmas, rgbs, deltas, rays, T_thresh)
-                    image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
-                    
-                    depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
-                    image = image.view(*prefix, self.latent_dim)
-                    depth_normalized = depth_normalized.view(*prefix)
-                    depth = depth.view(*prefix)
+            # ray integral of extra_out
+            extra_projections = []
+            for (extra_out, extra_out_info) in zip(extra_outs, extra_out_infos):
+                weights_sum_feat, _, feat = raymarching.composite_rays_train_sem(sigmas, extra_out, deltas, rays, T_thresh)
+                feat = feat + (1 - weights_sum_feat).unsqueeze(-1) * 1
+                
+                feat_idx, feat_dim = extra_out_info
+                feat = feat.view(*prefix, feat_dim)
+                extra_projections.append(feat) 
             
+            depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
+            image = image.view(*prefix, 3)
+            depth_normalized = depth_normalized.view(*prefix)
+            depth = depth.view(*prefix)
             results['weights_sum'] = weights_sum
 
         else: 
-            dtype = torch.float32
-            if use_low_res_img:
-                weights_sum = torch.zeros(N, dtype=dtype, device=device)
-                depth = torch.zeros(N, dtype=dtype, device=device)
-                image_low_res = torch.zeros(N, 3, dtype=dtype, device=device)
-                
-                n_alive = N # NOTE: resolution of the GUI W*H
-                rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
-                rays_t = nears.clone() # [N]
+            image, depth, depth_normalized = self.infer_rays(prefix, 3, -1, rays_o, rays_d, nears, fars, N, max_steps, device, perturb, dt_gamma, T_thresh)
 
-                step = 0
-                
-                while step < max_steps:
-                    n_alive = rays_alive.shape[0]
-                    if n_alive <= 0:
-                        break
-
-                    n_step = max(min(N // n_alive, 8), 1)
-
-                    xyzs, dirs, deltas = raymarching.march_rays(
-                        n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, 
-                        self.bound, self.density_bitfield, self.cascade, self.grid_size, 
-                        nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps
-                    )
-
-                    sigmas, _, low_res_rgb = self(xyzs, dirs)
-                    sigmas = self.density_scale * sigmas
-
-                    raymarching.composite_rays(
-                        n_alive, n_step, rays_alive, rays_t, sigmas, low_res_rgb, deltas, 
-                        weights_sum, depth, image_low_res, T_thresh
-                    )
-
-                    rays_alive = rays_alive[rays_alive >= 0]
-                    step += n_step
-
-                image_low_res = image_low_res + (1 - weights_sum).unsqueeze(-1) * bg_color
-
-                depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
-                depth_normalized = depth_normalized.view(*prefix)
-                image_low_res = image_low_res.view(*prefix, 3)
-                depth = depth.view(*prefix)
-
-                weights_sum_tmp = torch.zeros(N, dtype=dtype, device=device)
-                depth_tmp = torch.zeros(N, dtype=dtype, device=device)
-                image = torch.zeros(N, self.latent_dim, dtype=dtype, device=device)
-                n_alive = N # NOTE: resolution of the GUI W*H
-                rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
-                rays_t = nears.clone() # [N]
-
-                step = 0
-                while step < max_steps:
-                    n_alive = rays_alive.shape[0]
-                    if n_alive <= 0:
-                        break
-                    n_step = max(min(N // n_alive, 8), 1)
-
-                    xyzs, dirs, deltas = raymarching.march_rays(
-                        n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, 
-                        self.bound, self.density_bitfield, self.cascade, self.grid_size, 
-                        nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps
-                    )
-
-                    sigmas, rgbs, _ = self(xyzs, dirs)
-                    sigmas = self.density_scale * sigmas
-
-                    # id version
-                    raymarching.composite_rays_sem(
-                        n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, 
-                        weights_sum_tmp, depth_tmp, image, T_thresh, self.latent_dim
-                    )
-
-                    rays_alive = rays_alive[rays_alive >= 0]
-                    step += n_step
-                
-                image = image + (1 - weights_sum_tmp).unsqueeze(-1) * bg_color
-                image = image.view(*prefix, self.latent_dim)
-            else:
-                weights_sum = torch.zeros(N, dtype=dtype, device=device)
-                depth = torch.zeros(N, dtype=dtype, device=device)
-                image = torch.zeros(N, self.latent_dim, dtype=dtype, device=device)
-                
-                n_alive = N # NOTE: resolution of the GUI W*H
-                rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
-                rays_t = nears.clone() # [N]
-                step = 0
-                while step < max_steps:
-                    # count alive rays 
-                    n_alive = rays_alive.shape[0]
-                    # exit loop
-                    if n_alive <= 0:
-                        break
-                    # decide compact_steps
-                    n_step = max(min(N // n_alive, 8), 1)
-
-                    xyzs, dirs, deltas = raymarching.march_rays(
-                        n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, 
-                        self.bound, self.density_bitfield, self.cascade, self.grid_size, 
-                        nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps
-                    )
-
-                    sigmas, rgbs, _ = self(xyzs, dirs)
-                    sigmas = self.density_scale * sigmas
-
-                    raymarching.composite_rays_sem(
-                        n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, 
-                        weights_sum, depth, image, T_thresh, self.latent_dim
-                    ) # use latent dimension 4
-
-                    rays_alive = rays_alive[rays_alive >= 0]
-                    step += n_step
-
-                image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
-
-                depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
-                depth_normalized = depth_normalized.view(*prefix)
-                image = image.view(*prefix, self.latent_dim)
-                depth = depth.view(*prefix)
+            extra_projections = []
+            for extra_out_info in extra_out_infos:
+                feat_idx, feat_dim = extra_out_info
+                feat, _, _ = self.infer_rays(prefix, feat_dim, feat_idx, rays_o, rays_d, nears, fars, N, max_steps, device, perturb, dt_gamma, T_thresh)
+                extra_projections.append(feat)
  
         results['depth'] = depth
         results['depth_normalized'] = depth_normalized
-        results['latent'] = image
-        if use_low_res_img:
-            results['image']=image_low_res
-        results['dist_loss'] = None # NOTE have not implementated in cuda version
-
+        results['extra_outs'] = extra_projections
+        results['image']=image
         return results
-
-
-    def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, **kwargs):
-        # rays_o, rays_d: [B, N, 3], assumes B == 1
-        # return: image: [B, N, 3], depth: [B, N]
-
-        prefix = rays_o.shape[:-1]
-        rays_o = rays_o.contiguous().view(-1, 3)
-        rays_d = rays_d.contiguous().view(-1, 3)
-
-        N = rays_o.shape[0] # N = B * N, in fact
-        device = rays_o.device
-
-        # pre-calculate near far
-        nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, self.aabb_train if self.training else self.aabb_infer, self.min_near)
-
-        # mix background color
-        if self.bg_radius > 0:
-            # use the bg model to calculate bg_color
-            sph = raymarching.sph_from_ray(rays_o, rays_d, self.bg_radius) # [N, 2] in [-1, 1]
-            bg_color = self.background(sph, rays_d) # [N, 3]
-        elif bg_color is None:
-            bg_color = 1
-
-        # sem_bg_color = torch.zeros(self.sem_out_dim, device=device) # [3]
-        sem_bg_color = 1
-        results = {}
-
-        if self.training:
-            # setup counter
-            counter = self.step_counter[self.local_step % 16]
-            counter.zero_() # set to 0
-            self.local_step += 1
-
-            xyzs, dirs, deltas, rays = raymarching.march_rays_train(rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, counter, self.mean_count, perturb, 128, force_all_rays, dt_gamma, max_steps)
-            #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
-            
-            sigmas, rgbs, sems = self(xyzs, dirs)
-            # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
-            # sigmas = density_outputs['sigma']
-            # rgbs = self.color(xyzs, dirs, **density_outputs)
-            sigmas = self.density_scale * sigmas
-
-            #print(f'valid RGB query ratio: {mask.sum().item() / mask.shape[0]} (total = {mask.sum().item()})')
-
-            # special case for CCNeRF's residual learning
-            if len(sigmas.shape) == 2:
-                # NOTE: zehao ignore this part
-                # K = sigmas.shape[0]
-                # depths = []
-                # images = []
-                # for k in range(K):
-                #     weights_sum, depth, image = raymarching.composite_rays_train(sigmas[k], rgbs[k], deltas, rays, T_thresh)
-                #     image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
-                #     depth = torch.clamp(depth - nears, min=0) / (fars - nears)
-                #     images.append(image.view(*prefix, 3))
-                #     depths.append(depth.view(*prefix))
-            
-                # depth = torch.stack(depths, axis=0) # [K, B, N]
-                # image = torch.stack(images, axis=0) # [K, B, N, 3]
-                raise NotImplementedError()
-            else:
-                weights_sum, depth, image = raymarching.composite_rays_train(sigmas, rgbs, deltas, rays, T_thresh)
-                image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
-                
-                # NOTE zehao @ Dec 14 change ray fars by depth
-                # tolerance = 0.5
-                # nears2 = nears.clone().detach()
-                # fars2 = depth.clone().detach() + tolerance
-                # idx_near = fars2 < nears2
-                # fars2[idx_near] = nears2[idx_near] + tolerance
-
-                # xyzs2, dirs2, deltas2, rays2 = raymarching.march_rays_train(
-                #     rays_o.clone().detach(), rays_d.clone().detach(), self.bound, self.density_bitfield2, self.cascade, self.grid_size, 
-                #     nears2, fars2, counter, self.mean_count, perturb, 128, force_all_rays, dt_gamma, max_steps
-                # )
-                # # import ipdb;ipdb.set_trace() # breakpoint 368
-                # sigmas2, _, sems2 = self(xyzs2, dirs2)
-                # sigmas2 = self.density_scale * sigmas2
-                # weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas2, sems2, deltas2, rays2, T_thresh)
-                # image_sem = image_sem + (1 - weights_sum_sem).unsqueeze(-1) * sem_bg_color
-
-                if os.environ.get('BLOCKSEM', False):
-                    weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas.detach(), sems, deltas.detach(), rays.detach(), T_thresh)
-                else:
-                    weights_sum_sem, _, image_sem = raymarching.composite_rays_train_sem(sigmas, sems, deltas, rays, T_thresh)
-
-                image_sem = image_sem + (1 - weights_sum_sem).unsqueeze(-1) * sem_bg_color
-
-                depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
-                image = image.view(*prefix, 3)
-                depth_normalized = depth_normalized.view(*prefix)
-                depth = depth.view(*prefix)
-                image_sem = image_sem.view(*prefix, self.sem_out_dim)
-            
-            results['weights_sum'] = weights_sum
-            results['weights_sum_sem'] = weights_sum_sem
-
-        else: 
-            # allocate outputs 
-            # if use autocast, must init as half so it won't be autocasted and lose reference.
-            #dtype = torch.half if torch.is_autocast_enabled() else torch.float32
-            # output should always be float32! only network inference uses half.
-            dtype = torch.float32
-            
-            weights_sum = torch.zeros(N, dtype=dtype, device=device)
-            depth = torch.zeros(N, dtype=dtype, device=device)
-            image = torch.zeros(N, 3, dtype=dtype, device=device)
-            
-            n_alive = N # NOTE: resolution of the GUI W*H
-            rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
-            rays_t = nears.clone() # [N]
-
-            step = 0
-            
-            while step < max_steps:
-
-                # count alive rays 
-                n_alive = rays_alive.shape[0]
-                
-                # exit loop
-                if n_alive <= 0:
-                    break
-
-                # decide compact_steps
-                n_step = max(min(N // n_alive, 8), 1)
-
-                xyzs, dirs, deltas = raymarching.march_rays(
-                    n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, 
-                    self.bound, self.density_bitfield, self.cascade, self.grid_size, 
-                    nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps
-                )
-
-                sigmas, rgbs, sems = self(xyzs, dirs)
-                # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
-                # sigmas = density_outputs['sigma']
-                # rgbs = self.color(xyzs, dirs, **density_outputs)
-                sigmas = self.density_scale * sigmas
-
-                raymarching.composite_rays(
-                    n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, 
-                    weights_sum, depth, image, T_thresh
-                )
-
-                rays_alive = rays_alive[rays_alive >= 0]
-
-                #print(f'step = {step}, n_step = {n_step}, n_alive = {n_alive}, xyzs: {xyzs.shape}')
-
-                step += n_step
-
-            image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
-
-            # NOTE: check wether need to standardize will supervision on depth
-            # depth = torch.clamp(depth - nears, min=0) / (fars - nears)
-            depth_normalized = torch.clamp(depth - nears, min=0) / (fars - nears)
-            depth_normalized = depth_normalized.view(*prefix)
-            image = image.view(*prefix, 3)
-            depth = depth.view(*prefix)
-
-            # render semantic image
-            weights_sum = torch.zeros(N, dtype=dtype, device=device)
-            depth_tmp = torch.zeros(N, dtype=dtype, device=device)
-            image_sem = torch.zeros(N, self.sem_out_dim, dtype=dtype, device=device)
-            n_alive = N # NOTE: resolution of the GUI W*H
-            rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
-            rays_t = nears.clone() # [N]
-
-            step = 0
-            while step < max_steps:
-                n_alive = rays_alive.shape[0]
-                if n_alive <= 0:
-                    break
-                n_step = max(min(N // n_alive, 8), 1)
-
-                xyzs, dirs, deltas = raymarching.march_rays(
-                    n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, 
-                    self.bound, self.density_bitfield, self.cascade, self.grid_size, 
-                    nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps
-                )
-
-                sigmas, rgbs, sems = self(xyzs, dirs)
-                sigmas = self.density_scale * sigmas
-
-                # id version
-                raymarching.composite_rays_sem(
-                    n_alive, n_step, rays_alive, rays_t, sigmas, sems, deltas, 
-                    weights_sum, depth_tmp, image_sem, T_thresh, self.sem_out_dim
-                )
-
-                # rgb version
-                # raymarching.composite_rays(
-                #     n_alive, n_step, rays_alive, rays_t, sigmas, sems, deltas, 
-                #     weights_sum, depth_tmp, image_sem, T_thresh
-                # )
-
-                rays_alive = rays_alive[rays_alive >= 0]
-                step += n_step
-            
-            image_sem = image_sem + (1 - weights_sum).unsqueeze(-1) * sem_bg_color
-            image_sem = image_sem.view(*prefix, self.sem_out_dim)
-        
-        results['depth'] = depth
-        results['depth_normalized'] = depth_normalized
-        results['image'] = image
-        results['image_sem'] = image_sem
-
-        results['dist_loss'] = None # NOTE have not implementated in cuda version
-
-        return results
-
-    @torch.no_grad()
-    def mark_untrained_grid(self, poses, intrinsic, S=64):
-        # poses: [B, 4, 4]
-        # intrinsic: [3, 3]
-
-        if not self.cuda_ray:
-            return
-        
-        if isinstance(poses, np.ndarray):
-            poses = torch.from_numpy(poses)
-
-        B = poses.shape[0]
-        
-        fx, fy, cx, cy = intrinsic
-        
-        X = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
-        Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
-        Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
-
-        count = torch.zeros_like(self.density_grid)
-        poses = poses.to(count.device)
-
-        # 5-level loop, forgive me...
-
-        for xs in X:
-            for ys in Y:
-                for zs in Z:
-                    
-                    # construct points
-                    xx, yy, zz = custom_meshgrid(xs, ys, zs)
-                    coords = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N, 3], in [0, 128)
-                    indices = raymarching.morton3D(coords).long() # [N]
-                    world_xyzs = (2 * coords.float() / (self.grid_size - 1) - 1).unsqueeze(0) # [1, N, 3] in [-1, 1]
-
-                    # cascading
-                    for cas in range(self.cascade):
-                        bound = min(2 ** cas, self.bound)
-                        half_grid_size = bound / self.grid_size
-                        # scale to current cascade's resolution
-                        cas_world_xyzs = world_xyzs * (bound - half_grid_size)
-
-                        # split batch to avoid OOM
-                        head = 0
-                        while head < B:
-                            tail = min(head + S, B)
-
-                            # world2cam transform (poses is c2w, so we need to transpose it. Another transpose is needed for batched matmul, so the final form is without transpose.)
-                            cam_xyzs = cas_world_xyzs - poses[head:tail, :3, 3].unsqueeze(1)
-                            cam_xyzs = cam_xyzs @ poses[head:tail, :3, :3] # [S, N, 3]
-                            
-                            # query if point is covered by any camera
-                            mask_z = cam_xyzs[:, :, 2] > 0 # [S, N]
-                            mask_x = torch.abs(cam_xyzs[:, :, 0]) < cx / fx * cam_xyzs[:, :, 2] + half_grid_size * 2
-                            mask_y = torch.abs(cam_xyzs[:, :, 1]) < cy / fy * cam_xyzs[:, :, 2] + half_grid_size * 2
-                            mask = (mask_z & mask_x & mask_y).sum(0).reshape(-1) # [N]
-
-                            # update count 
-                            count[cas, indices] += mask
-                            head += S
-    
-        # mark untrained grid as -1
-        self.density_grid[count == 0] = -1
-
-        print(f'[mark untrained grid] {(count == 0).sum()} from {self.grid_size ** 3 * self.cascade}')
 
     @torch.no_grad()
     def update_extra_state(self, decay=0.95, S=128):
@@ -878,57 +295,84 @@ class NeRFRenderer(nn.Module):
 
         #print(f'[density grid] min={self.density_grid.min().item():.4f}, max={self.density_grid.max().item():.4f}, mean={self.mean_density:.4f}, occ_rate={(self.density_grid > 0.01).sum() / (128**3 * self.cascade):.3f} | [step counter] mean={self.mean_count}')
 
+    @torch.no_grad()
+    def mark_untrained_grid(self, poses, intrinsic, S=64):
+        # poses: [B, 4, 4]
+        # intrinsic: [3, 3]
 
-    def render(self, rays_o, rays_d, staged=False, max_ray_batch=4096, **kwargs):
+        if not self.cuda_ray:
+            return
+        
+        if isinstance(poses, np.ndarray):
+            poses = torch.from_numpy(poses)
+
+        B = poses.shape[0]
+        
+        fx, fy, cx, cy = intrinsic
+        
+        X = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+
+        count = torch.zeros_like(self.density_grid)
+        poses = poses.to(count.device)
+
+        # 5-level loop, forgive me...
+
+        for xs in X:
+            for ys in Y:
+                for zs in Z:
+                    
+                    # construct points
+                    xx, yy, zz = custom_meshgrid(xs, ys, zs)
+                    coords = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N, 3], in [0, 128)
+                    indices = raymarching.morton3D(coords).long() # [N]
+                    world_xyzs = (2 * coords.float() / (self.grid_size - 1) - 1).unsqueeze(0) # [1, N, 3] in [-1, 1]
+
+                    # cascading
+                    for cas in range(self.cascade):
+                        bound = min(2 ** cas, self.bound)
+                        half_grid_size = bound / self.grid_size
+                        # scale to current cascade's resolution
+                        cas_world_xyzs = world_xyzs * (bound - half_grid_size)
+
+                        # split batch to avoid OOM
+                        head = 0
+                        while head < B:
+                            tail = min(head + S, B)
+
+                            # world2cam transform (poses is c2w, so we need to transpose it. Another transpose is needed for batched matmul, so the final form is without transpose.)
+                            cam_xyzs = cas_world_xyzs - poses[head:tail, :3, 3].unsqueeze(1)
+                            cam_xyzs = cam_xyzs @ poses[head:tail, :3, :3] # [S, N, 3]
+                            
+                            # query if point is covered by any camera
+                            mask_z = cam_xyzs[:, :, 2] > 0 # [S, N]
+                            mask_x = torch.abs(cam_xyzs[:, :, 0]) < cx / fx * cam_xyzs[:, :, 2] + half_grid_size * 2
+                            mask_y = torch.abs(cam_xyzs[:, :, 1]) < cy / fy * cam_xyzs[:, :, 2] + half_grid_size * 2
+                            mask = (mask_z & mask_x & mask_y).sum(0).reshape(-1) # [N]
+
+                            # update count 
+                            count[cas, indices] += mask
+                            head += S
+    
+        # mark untrained grid as -1
+        self.density_grid[count == 0] = -1
+
+        print(f'[mark untrained grid] {(count == 0).sum()} from {self.grid_size ** 3 * self.cascade}')
+
+    def render(self, rays_o, rays_d, **kwargs):
         self.warmup_iter = kwargs['warmup_iter']
         self.global_step = kwargs['global_step']
+        extra_configs = kwargs['extra_configs']
+        extra_out_infos = []
+        for idx, config in enumerate(extra_configs):
+            extra_out_infos.append((idx, config.dim_out))
 
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # return: pred_rgb: [B, N, 3]
 
-        if self.cuda_ray:
-            _run = self.run_cuda
-        else:
-            _run = self.run
-
-        B, N = rays_o.shape[:2]
-        device = rays_o.device
-
+        _run = self.run_cuda
         # never stage when cuda_ray
-        if staged and not self.cuda_ray:
-            depth = torch.empty((B, N), device=device)
-            image = torch.empty((B, N, 3), device=device)
-            image_sem = torch.empty((B, N, self.sem_out_dim), device=device) 
-
-            for b in range(B):
-                head = 0
-                while head < N:
-                    tail = min(head + max_ray_batch, N)
-                    results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], **kwargs)
-                    depth[b:b+1, head:tail] = results_['depth']
-                    image[b:b+1, head:tail] = results_['image']
-                    image_sem[b:b+1, head:tail] = results_['image_sem']
-                    head += max_ray_batch
-            
-            results = {}
-            results['depth'] = depth
-            results['image'] = image
-            results['image_sem'] = image_sem
-
-        else:
-            results = _run(rays_o, rays_d, **kwargs)
-
-        return results
-
-    def render_latent(self, rays_o, rays_d, staged=False, max_ray_batch=4096, **kwargs):
-        self.warmup_iter = kwargs['warmup_iter']
-        self.global_step = kwargs['global_step']
-
-        # rays_o, rays_d: [B, N, 3], assumes B == 1
-        # return: pred_rgb: [B, N, 3]
-
-        _run = self.run_cuda_latent
-        # never stage when cuda_ray
-        results = _run(rays_o, rays_d, **kwargs)
+        results = _run(rays_o, rays_d, extra_out_infos=extra_out_infos, **kwargs)
 
         return results

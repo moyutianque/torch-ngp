@@ -5,8 +5,7 @@ from nerf_sem.provider import NeRFDataset
 from nerf.gui import NeRFGUI
 from nerf_sem.utils import *
 
-from functools import partial
-from loss import huber_loss
+from easydict import EasyDict as edict
 from diffusers import StableDiffusionImg2ImgPipeline
 #torch.autograd.set_detect_anomaly(True)
 
@@ -22,6 +21,7 @@ if __name__ == '__main__':
     ### training options
     parser.add_argument('--iters', type=int, default=30000, help="training iters")
     parser.add_argument('--lr', type=float, default=1e-2, help="initial learning rate")
+    parser.add_argument('--lr_latent', type=float, default=1e-4, help="initial learning rate")
     parser.add_argument('--ckpt', type=str, default='latest')
     parser.add_argument('--num_rays', type=int, default=4096, help="num rays sampled per image for each training step")
     parser.add_argument('--cuda_ray', action='store_true', help="use CUDA raymarching instead of pytorch")
@@ -85,10 +85,7 @@ if __name__ == '__main__':
     parser.add_argument('--radial_depth', action='store_true', help="change plane-to-plane depth to radial length")
     parser.add_argument('--reprojection_loss', action='store_true', help="reprojection")
     parser.add_argument('--latent', action='store_true', help="latent nerf")
-    parser.add_argument('--latent_space', choices=['original', 'img_size'], default='original', type=str)
-    parser.add_argument('--latent_dim', type=int, default=4, help="latent dimt")
     parser.add_argument('--low_res_img', action='store_true', help="latent nerf with low res image")
-    parser.add_argument('--train_decoder', action='store_true', help="train the decoder")
 
     opt = parser.parse_args()
 
@@ -130,14 +127,7 @@ if __name__ == '__main__':
 
 
     criterion = torch.nn.MSELoss(reduction='none')
-    if 'rgb' in opt.sem_mode:
-        criterion_sem = torch.nn.MSELoss(reduction='none')
-    else:
-        criterion_sem = torch.nn.CrossEntropyLoss(reduction='none')
-        # criterion_sem = torch.nn.BCEWithLogitsLoss(reduction='none')
-        
-    #criterion = partial(huber_loss, reduction='none')
-    #criterion = torch.nn.HuberLoss(reduction='none', beta=0.1) # only available after torch 1.10 ?
+    criterion_ce = torch.nn.CrossEntropyLoss(reduction='none')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -164,7 +154,7 @@ if __name__ == '__main__':
             min_near=opt.min_near,
             density_thresh=opt.density_thresh,
             bg_radius=opt.bg_radius,
-            aabb_bounds=[opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz]
+            aabb_bounds=[opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz],
         )
 
         trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, criterion_sem=criterion_sem, fp16=opt.fp16, metrics=metrics, use_checkpoint=opt.ckpt)
@@ -185,6 +175,8 @@ if __name__ == '__main__':
     
     else:
         train_loader = NeRFDataset(opt, device=device, type='train', vae=vae).dataloader()
+        extra_configs = [edict({'dim_out':32, 'hidden_dim': 64, 'num_layers':2, 'geo_only': False, 'act_type': None})]
+
         model = NeRFNetwork(
             encoding="hashgrid",
             bound=opt.bound,
@@ -194,18 +186,12 @@ if __name__ == '__main__':
             density_thresh=opt.density_thresh,
             bg_radius=opt.bg_radius,
             aabb_bounds=[opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz],
-            sem_out_dim=train_loader._data.num_labels,
-            use_latent=opt.latent,
-            low_res_img=opt.low_res_img,
-            latent_dim=opt.latent_dim
+            extra_configs=extra_configs
         )
         
         print(model)
 
-        if opt.train_decoder:
-            optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr) + [{'params': vae.parameters(), 'lr': opt.lr * 0.001}], betas=(0.9, 0.99), eps=1e-15)
-        else:
-            optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
+        optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
         # optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15, weight_decay=1e-5) # NOTE zehao add L2 normalization on weights
 
         # decay to 0.1 * init_lr at last iter step
@@ -214,11 +200,11 @@ if __name__ == '__main__':
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
         trainer = Trainer(
             'ngp', opt, model, device=device, workspace=opt.workspace, 
-            optimizer=optimizer, criterion=criterion, criterion_sem=criterion_sem, 
+            optimizer=optimizer, criterion=criterion, criterion_ce=criterion_ce, 
             ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, 
             scheduler_update_every_step=True, metrics=metrics, 
             use_checkpoint=opt.ckpt, eval_interval=50, save_iter=opt.save_iter, 
-            vae=vae
+            vae=vae, extra_configs=extra_configs
         )
 
         if opt.gui:
@@ -239,19 +225,3 @@ if __name__ == '__main__':
                     print(k, ":", v)
                 print()
             print("Experiment finished")
-
-
-            # valid_loader = NeRFDataset(opt, device=device, type='val', downscale=1, vae=vae).dataloader()
-
-            # max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
-            # trainer.train(train_loader, valid_loader, max_epoch)
-
-            # # also test
-            # test_loader = NeRFDataset(opt, device=device, type='test', vae=vae).dataloader()
-            
-            # if test_loader.has_gt:
-            #     trainer.evaluate(test_loader) # blender has gt, so evaluate it.
-            
-            # trainer.test(test_loader, write_video=True) # test and save video
-            
-            # trainer.save_mesh(resolution=256, threshold=10)

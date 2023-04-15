@@ -131,7 +131,6 @@ class PatchFeaUNet(nn.Module):
         x_rgb = self.act(x_rgb)
         return x_rgb
 
-
 class PatchFeaDirUNet(nn.Module):
     def __init__(self, rgb_feat_channels, alpha_feat_channels, rgb_channels, alpha_channels, dir_channels=0):
         super(PatchFeaDirUNet, self).__init__()
