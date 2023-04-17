@@ -207,7 +207,7 @@ def extract_fields(bound_min, bound_max, resolution, query_func, S=128):
                     u[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = val
     return u
 
-def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128, sem_map_type='id', return_pts=False):
+def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128, return_pts=False):
 
     X = torch.linspace(bound_min[0], bound_max[0], resolution).split(S)
     Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(S)
@@ -217,10 +217,8 @@ def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128, sem_
     if return_pts:
         u_pts = np.zeros([resolution, resolution, resolution, 3], dtype=np.float32)
 
-    if sem_map_type == 'rgb':
-        u_sem = np.zeros([resolution, resolution, resolution, 3], dtype=np.float32)
-    else:
-        u_sem = np.zeros([resolution, resolution, resolution], dtype=np.float32)
+    u_sem = np.zeros([resolution, resolution, resolution], dtype=np.float32)
+    
     with torch.no_grad():
         for xi, xs in enumerate(X):
             for yi, ys in enumerate(Y):
@@ -235,13 +233,9 @@ def extract_fields_sem(bound_min, bound_max, resolution, query_func, S=128, sem_
 
                     u_density[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = val
 
-                    if sem_map_type == 'rgb':
-                        sem_val = sem_out.reshape(len(xs), len(ys), len(zs), -1).detach().cpu().numpy() # [S, 1] --> [x, y, z]
-                        u_sem[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs), :] = sem_val
-                    else:
-                        sem_out = torch.argmax(sem_out, dim=-1)
-                        sem_val = sem_out.reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
-                        u_sem[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = sem_val
+                    sem_out = torch.argmax(sem_out, dim=-1)
+                    sem_val = sem_out.reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
+                    u_sem[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = sem_val
     if return_pts:
         return u_density, u_sem, u_pts
     return u_density, u_sem
@@ -496,8 +490,24 @@ class Trainer(object):
             from nerf.clip_utils import CLIPLoss
             self.clip_loss = CLIPLoss(self.device)
             self.clip_loss.prepare_text([self.opt.clip_text]) # only support one text prompt now...
-
-
+        
+        normal_net_dim_in = 1
+        if self.opt.sem_label:
+            print('add parameter groups sem_label_emb successfully')
+            self.optimizer.add_param_group({"params": self.model.sem_label_emb.parameters(), "lr": self.opt.lr})
+            normal_net_dim_in += 16
+        if self.opt.sem_ins:
+            print('add parameter groups sem_ins_emb successfully')
+            self.optimizer.add_param_group({"params": self.model.sem_ins_emb.parameters(), "lr": self.opt.lr})
+            normal_net_dim_in += 16
+        
+        if self.opt.use_normal:
+            from .UNet import PatchFeaUNet
+            # self.norm_net = PatchFeaUNet(normal_net_dim_in, 3, act='tanh').cuda()
+            self.norm_net = PatchFeaUNet(normal_net_dim_in, 3, act='none').cuda()
+            self.optimizer.add_param_group({"params": self.norm_net.parameters(), "lr": self.opt.lr})
+            print('add parameter groups norm_net successfully')
+        
     def __del__(self):
         if self.log_ptr: 
             self.log_ptr.close()
@@ -535,6 +545,65 @@ class Trainer(object):
             loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
         loss_rgb = loss.mean()
 
+        loss_depth = torch.tensor(0.).cuda()
+        if self.opt.use_depth:
+            pred_depth = outputs['depth'] * data['depth_radial2plane']
+            pred_depth = pred_depth.view(-1, self.opt.patch_size, self.opt.patch_size, 1).permute(0, 3, 1, 2).contiguous()
+            gt_depth = data['images_depth'].view(-1, self.opt.patch_size, self.opt.patch_size, 1).permute(0, 3, 1, 2).contiguous()
+            
+            loss_depth = torch.abs(torch.log(gt_depth)-torch.log(pred_depth))
+            filtered_idx = (~torch.isinf(loss_depth)) & (~torch.isnan(loss_depth))
+            loss_depth = loss_depth[filtered_idx].mean()
+
+            # NOTE: simple version
+            # loss_depth = self.criterion(pred_depth, gt_depth).mean()
+
+        loss_normal = torch.tensor(0.).cuda()
+        if self.opt.use_normal:
+            pred_depth = outputs['depth'] * data['depth_radial2plane']
+            pred_depth = pred_depth.view(-1, self.opt.patch_size, self.opt.patch_size, 1).permute(0, 3, 1, 2).contiguous()
+            gt_normal = data['normal_map']
+            gt_normal_msk = data['normal_msk']
+            gt_normal = gt_normal.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
+            gt_normal_msk = gt_normal_msk.view(-1, self.opt.patch_size, self.opt.patch_size, 1).permute(0, 3, 1, 2).contiguous()
+            gt_normal_msk = gt_normal_msk.repeat(1,3,1,1)
+            
+            if self.opt.sem_label:
+                gt_sem_label = data['sem_map']
+                gt_sem_label = gt_sem_label.view(-1, self.opt.patch_size, self.opt.patch_size).contiguous()
+                gt_sem_label = self.model.sem_label_emb(gt_sem_label).permute(0,3,1,2)
+                pred_depth = torch.cat([pred_depth, gt_sem_label], dim=1)
+            
+            indices = {i for i in range(len(gt_normal))}
+            if self.opt.sem_ins:
+                gt_sem_ins = data['ins_map']
+                gt_sem_ins = gt_sem_ins.view(-1, self.opt.patch_size, self.opt.patch_size).contiguous()
+                
+                # NOTE: filter out patch who only has one label
+                for i, sem_ins in enumerate(gt_sem_ins):
+                    if len(torch.unique(sem_ins)) <= 1:
+                        indices.remove(i)
+
+                gt_sem_ins = self.model.sem_ins_emb(gt_sem_ins).permute(0,3,1,2)
+                pred_depth = torch.cat([pred_depth, gt_sem_ins], dim=1)
+
+            indices = np.array(list(indices))   
+
+            if len(indices)> 0: 
+                pred_depth = pred_depth[indices, :, :, :]
+                gt_normal_msk = gt_normal_msk[indices, :, :, :]
+                gt_normal = gt_normal[indices, :, :, :]
+
+                pred_norm = self.norm_net(pred_depth)
+                if torch.any(gt_normal_msk):
+                    loss_normal = torch.tensor(0.).cuda()
+                    cnt=0
+                    for i in range(pred_norm.shape[0]):
+                        if torch.any(gt_normal_msk[i]):
+                            cnt += 1
+                            loss_normal += self.criterion(pred_norm[i][:,1:-1,1:-1][gt_normal_msk[i][:,1:-1,1:-1]], gt_normal[i][:,1:-1,1:-1][gt_normal_msk[i][:,1:-1,1:-1]].to(gt_rgb.dtype)).mean()
+                    loss_normal = loss_normal/cnt
+
         # TODO: make multiple extra outs possible
         extra_losses = []
         extra_outs = outputs['extra_outs']    
@@ -562,13 +631,15 @@ class Trainer(object):
             extra_losses.append(loss.mean())
         loss = {
             'loss_rgb': loss_rgb,
+            'loss_depth': loss_depth,
+            'loss_normal': loss_normal,
             "extra_losses": extra_losses,
         }
 
         return pred_rgb, gt_rgb, loss
 
     # moved out bg_color and perturb for more flexible control...
-    def test_step(self, data, bg_color=None, perturb=False):  
+    def test_step(self, data, bg_color=None, perturb=False, extra_in=None):  
         
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
@@ -583,15 +654,39 @@ class Trainer(object):
         pred_depth = outputs['depth'].reshape(-1, H, W)
 
         extras = []
-        for extra_out in outputs['extra_outs'] :
-            extra_out = extra_out.view(-1, H, W, extra_out.shape[-1]).permute(0, 3, 1, 2).contiguous() 
-            if os.environ.get('USE_UNet', False):
-                decode_rgb = self.conv(extra_out)
-            else:
-                for layer in self.conv:
-                    extra_out = layer(extra_out)
-                    decode_rgb = self.vae.decode(extra_out)
-            extras.append(decode_rgb)
+        if self.opt.use_normal:
+            assert extra_in is not None
+            plane_depth = pred_depth * data['depth_radial2plane']
+            plane_depth = plane_depth[None, ...]
+            gt_normal = extra_in['normal_map']
+            gt_normal_msk = extra_in['normal_msk']
+            if self.opt.sem_label:
+                gt_sem_label = extra_in['sem_map']
+                gt_sem_label = torch.from_numpy(gt_sem_label)[None, ...].cuda()
+                gt_sem_label = self.model.sem_label_emb(gt_sem_label).permute(0,3,1,2)
+                plane_depth = torch.cat([plane_depth, gt_sem_label], dim=1)
+            
+            if self.opt.sem_ins:
+                gt_sem_ins = extra_in['ins_map']
+                gt_sem_ins = torch.from_numpy(gt_sem_ins)[None, ...].cuda()
+                gt_sem_ins = self.model.sem_ins_emb(gt_sem_ins).permute(0,3,1,2)
+                plane_depth = torch.cat([plane_depth, gt_sem_ins], dim=1)
+            
+            pred_norm = self.norm_net(plane_depth)
+            pred_norm += 1
+            pred_norm /= 2
+            pred_norm[:, :, ~gt_normal_msk] = 0
+            extras.append(pred_norm)
+        else:
+            for extra_out in outputs['extra_outs'] :
+                extra_out = extra_out.view(-1, H, W, extra_out.shape[-1]).permute(0, 3, 1, 2).contiguous() 
+                if os.environ.get('USE_UNet', False):
+                    decode_rgb = self.conv(extra_out)
+                else:
+                    for layer in self.conv:
+                        extra_out = layer(extra_out)
+                        decode_rgb = self.vae.decode(extra_out)
+                extras.append(decode_rgb)
 
         return pred_rgb, pred_depth_normalized, pred_depth, extras
 
@@ -618,7 +713,7 @@ class Trainer(object):
 
         self.log(f"==> Finished saving mesh.")
 
-    def get_3dmap(self, resolution, sem_map_type, return_pts=False):
+    def get_3dmap(self, resolution, return_pts=False):
         def query_func(pts):
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=self.fp16):
@@ -626,13 +721,13 @@ class Trainer(object):
                     sem_out = self.model.sem(pts.to(self.device), **density_outputs)
             return density_outputs['sigma'], sem_out
         
-        return extract_fields_sem(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, query_func=query_func, sem_map_type=sem_map_type, return_pts=return_pts)
+        return extract_fields_sem(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, query_func=query_func, return_pts=return_pts)
 
-    def save_3dmap(self, resolution=256, sem_map_type='rgb'):
+    def save_3dmap(self, resolution=256):
         save_path = os.path.join(self.workspace, f'{self.name}_3dmap.h5')
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        density_out, sem_out = self.get_3dmap(resolution, sem_map_type, return_pts=False)
+        density_out, sem_out = self.get_3dmap(resolution, return_pts=False)
 
         with h5py.File(save_path, "w") as f:
             f.create_dataset("density", data=density_out)
@@ -692,10 +787,11 @@ class Trainer(object):
 
         self.log(f"==> Finished Test.")
         
-    def train(self, train_loader, step=16, val_data=None, sem_map_type='rgb'):
+    def train(self, train_loader, step=16, val_data=None):
         self.model.train()
 
         total_loss_rgb = torch.tensor([0], dtype=torch.float32, device=self.device)
+        total_loss_normal = torch.tensor([0], dtype=torch.float32, device=self.device)
         total_loss_extra = torch.tensor([0], dtype=torch.float32, device=self.device)
         
         loader = iter(train_loader)
@@ -727,9 +823,16 @@ class Trainer(object):
                 preds, truths, loss_dict = self.train_step(data)
 
             tot_loss = loss_dict['loss_rgb'].clone()
-            if os.environ.get('INCLUDE_LATENT_LOSS', False):
-                for extra_loss in loss_dict['extra_losses']:
-                    tot_loss += extra_loss
+
+            if self.global_step > self.opt.warmup_iter:
+                if self.opt.use_normal:
+                    tot_loss += loss_dict['loss_normal']
+                if self.opt.use_depth:
+                    tot_loss += loss_dict['loss_depth']
+
+                if os.environ.get('INCLUDE_LATENT_LOSS', False):
+                    for extra_loss in loss_dict['extra_losses']:
+                        tot_loss += extra_loss
 
             self.scaler.scale(tot_loss).backward()
                 
@@ -743,9 +846,12 @@ class Trainer(object):
                 total_loss_extra += loss_dict['extra_losses'][0].detach()
             if 'loss_rgb' in loss_dict:
                 total_loss_rgb += loss_dict['loss_rgb'].detach()
+            
+            if 'loss_normal' in loss_dict:
+                total_loss_normal += loss_dict['loss_normal'].detach()
 
             if self.global_step != 0 and (self.global_step % self.opt.save_iter == 0):
-                self.get_view_sythesis(val_data, train_loader._data.intrinsics, train_loader._data.test_len, self.global_step, sem_map_type)
+                self.get_view_sythesis(val_data, train_loader._data.intrinsics, train_loader._data.test_len, self.global_step, train_loader._data.depth_radial2plane)
                 self.model.training = True
                 self.save_checkpoint(full=True, best=False, remove_old=False)
                 self.epoch += 1
@@ -754,34 +860,44 @@ class Trainer(object):
             self.ema.update()
 
         rgb_loss = total_loss_rgb.item() / step
+        normal_loss = total_loss_normal.item() / step
         extra_loss_record = total_loss_extra.item() / step
 
         outputs = {
             'l_rgb': rgb_loss,
+            'l_normal': normal_loss,
             'l_extra': extra_loss_record,
             'lr': self.optimizer.param_groups[0]['lr'],
         }
 
         return outputs    
 
-    def get_view_sythesis(self, val_data, intrinsics, test_len, iters, sem_map_type='rgb'):
+    def get_view_sythesis(self, val_data, intrinsics, test_len, iters, depth_radial2plane=None):
         val_results = []
         save_path = os.path.join(self.workspace, 'vis_eval')
         os.makedirs(save_path, exist_ok=True)
         psnr_list = []
         psnr_list_oldview = []
         for j, item in enumerate(zip(*val_data)):
-            (p, im, im_sem) = item
+            (p, im, depth, extra_im) = item
             test_output = self.test_gui(
                     p, intrinsics, 
-                    im.shape[1], im.shape[0], bg_color=torch.ones(3).float()
+                    im.shape[1], im.shape[0], bg_color=torch.ones(3).float(), 
+                    depth_radial2plane=depth_radial2plane,
+                    extra_in = extra_im
                 )
 
             img_rgb = (im * 255).astype(np.uint8)
             pred = (test_output['image'] * 255).astype(np.uint8)
             pred_depth = (test_output['depth'] * 255).astype(np.uint8)
             depth_ori = test_output['depth_ori']
-            decoded_rgb = (test_output['decoded_rgb'] * 255).astype(np.uint8)
+
+            if self.opt.use_normal:
+                gt_normal = ((extra_im['normal_map'] + 1)/2 * 255).astype(np.uint8)
+
+            decoded_rgb = None
+            if test_output['decoded_rgb'] is not None:
+                decoded_rgb = (test_output['decoded_rgb'] * 255).astype(np.uint8)
             
             prefix = ''
             if len(val_data[0])-j <= test_len:
@@ -793,14 +909,17 @@ class Trainer(object):
 
             cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}gt.png'), cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_rgb_{prefix}.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
-            cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_decoded_rgb_{prefix}.png'), cv2.cvtColor(decoded_rgb, cv2.COLOR_RGB2BGR))
+            if decoded_rgb is not None:
+                cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_decoded_rgb_{prefix}.png'), cv2.cvtColor(decoded_rgb, cv2.COLOR_RGB2BGR))
             cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_depth_{prefix}.png'), pred_depth)
+            if self.opt.use_normal:
+                cv2.imwrite(os.path.join(save_path, f'{iters}_{j}_normal_{prefix}.png'), cv2.cvtColor(gt_normal, cv2.COLOR_RGB2BGR))
             val_results.append(test_output)
 
         self.model.train()
 
     # [GUI] test on a single image
-    def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1, downscale=1):
+    def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1, downscale=1, depth_radial2plane=None, extra_in=None):
         
         # render resolution (may need downscale to for better frame rate)
         rH = int(H * downscale)
@@ -817,6 +936,8 @@ class Trainer(object):
             'H': rH,
             'W': rW,
         }
+        if depth_radial2plane is not None:
+            data.update({"depth_radial2plane": depth_radial2plane})
         
         self.model.eval()
 
@@ -827,7 +948,7 @@ class Trainer(object):
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 # here spp is used as perturb random seed! (but not perturb the first sample)
-                preds, preds_depth, preds_depth_ori, extras = self.test_step(data, bg_color=bg_color, perturb=False if spp == 1 else spp)
+                preds, preds_depth, preds_depth_ori, extras = self.test_step(data, extra_in=extra_in, bg_color=bg_color, perturb=False if spp == 1 else spp)
 
         if self.ema is not None:
             self.ema.restore()
@@ -841,7 +962,10 @@ class Trainer(object):
         pred_depth = preds_depth[0].detach().cpu().numpy()
         preds_depth_ori = preds_depth_ori[0].detach().cpu().numpy()
 
-        decoded_rgb = extras[0][0].detach().permute(1,2,0).cpu().numpy()
+        decoded_rgb = None
+        if len(extras) != 0:
+            decoded_rgb = extras[0][0].detach().permute(1,2,0).cpu().numpy()
+        
         outputs = {
             'image': pred,
             'depth': pred_depth,

@@ -45,7 +45,7 @@ def filter_dust(sm_np):
                 msk = (labels_out == 1)
     return sm_np * msk
 
-def draw_map(m):
+def draw_map(m, prefix="", interactive=True, voxelization=True):
     sem_labels = np.unique(m)
     mapper = {l:i for i, l in enumerate(sorted(sem_labels))}
     print(mapper)
@@ -65,24 +65,39 @@ def draw_map(m):
 
     color_palette = plt.get_cmap('Spectral')(np.linspace(0, 1, len(mapper)))
 
-    while True:
-        np.random.shuffle(color_palette)
+    if interactive:
+        while True:
+            np.random.shuffle(color_palette)
+            facecolors = color_palette[m]
+            facecolors = np.reshape(facecolors, (-1, 4))[pcd_msk]
+            pcd.colors = o3d.utility.Vector3dVector(facecolors[:,:3])
+
+            # pcd, ind = pcd.remove_radius_outlier(nb_points=70, radius=5)
+
+            voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=1)
+            # voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=1)
+            o3d.visualization.draw_geometries([voxel_grid], width=700, height=700)
+
+            # o3d.io.write_point_cloud("./sem_map.ply", pcd)    
+            in_key = input()
+            if in_key.strip() == 'q':
+                break
+    else:
         facecolors = color_palette[m]
         facecolors = np.reshape(facecolors, (-1, 4))[pcd_msk]
         pcd.colors = o3d.utility.Vector3dVector(facecolors[:,:3])
 
         # pcd, ind = pcd.remove_radius_outlier(nb_points=70, radius=5)
 
-        voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=1)
+        if voxelization:
+            voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=1)
         # voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=1)
-        o3d.visualization.draw_geometries([voxel_grid], width=700, height=700)
+        # o3d.visualization.draw_geometries([voxel_grid], width=700, height=700)
 
-        # o3d.io.write_point_cloud("./sem_map.ply", pcd)    
-        in_key = input()
-        if in_key.strip() == 'q':
-            break
-    
-    o3d.io.write_voxel_grid("./sem_map.ply", voxel_grid)
+    if voxelization:
+        o3d.io.write_voxel_grid(f"./outs/sem_map{prefix}.ply", voxel_grid)
+    else:
+        o3d.io.write_point_cloud(f"./outs/sem_map{prefix}.ply", pcd)
 
 def load_map(map_path):
     with h5py.File(map_path, "r") as f:
@@ -150,8 +165,18 @@ if __name__ == '__main__':
 
     # mask = dm > opt.d_thresh
     # sm[~mask] = 0
+
     with torch.no_grad():
         d_msk = process_density(dm, t1=opt.t1)
         sm_out = process_sem(sm, downsample_scale=opt.downsample_scale, msk2=d_msk)
-        # sm_out = filter_dust(sm_out)
-    draw_map(sm_out)
+        sm_out = filter_dust(sm_out)
+    
+    draw_map(np.copy(sm_out), prefix="", interactive=False, voxelization=False)
+    labels = np.unique(sm_out)
+    print(labels)
+
+    for i in labels:
+        sm_draw = np.copy(sm_out)
+        # sm_draw[(sm_draw!=i) & (sm_draw!=0)] = 1000
+        sm_draw[(sm_draw!=i)] = 0
+        draw_map(sm_draw, prefix=str(i), interactive=False, voxelization=False)

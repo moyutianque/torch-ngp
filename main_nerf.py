@@ -76,7 +76,6 @@ if __name__ == '__main__':
     parser.add_argument('--dist_start', type=int, default=15000)
     parser.add_argument('--distortion_loss', action='store_true', help="distortion loss of mip nerf 360")
     parser.add_argument('--depth_reg', action='store_true', help="depth regularization loss of regnerf")
-    parser.add_argument('--sem_mode', choices=['label_rgb', 'ins_rgb', 'label_id', 'ins_id'], default='label_id', type=str)
     parser.add_argument('--split_sem_code', action='store_true', help="")
     parser.add_argument('--sigma_dropout', type=int, default=0, help="sigma dropout")
     parser.add_argument('--depth_sup', action='store_true', help="include depth supervision")
@@ -87,6 +86,13 @@ if __name__ == '__main__':
     parser.add_argument('--latent', action='store_true', help="latent nerf")
     parser.add_argument('--low_res_img', action='store_true', help="latent nerf with low res image")
 
+    parser.add_argument('--load_sem', action='store_true', help="load semantic annotation in data loader")
+    # NOTE: add normal estimation task
+    parser.add_argument('--use_normal', action='store_true', help="add normal estimation problem")
+    parser.add_argument('--sem_label', action='store_true', help="whether use in normal prediction")
+    parser.add_argument('--sem_ins', action='store_true', help="whether use in normal prediction")
+
+    parser.add_argument('--use_depth', action='store_true', help="add depth estimation problem")
     opt = parser.parse_args()
 
     if opt.O:
@@ -108,13 +114,10 @@ if __name__ == '__main__':
         opt.fp16 = True
         assert opt.bg_radius <= 0, "background model is not implemented for --tcnn"
         if opt.tcnn_sem:
-            if 'rgb' in opt.sem_mode:
-                from nerf_sem.network_tcnn import NeRFNetwork
+            if opt.split_sem_code:
+                from nerf_sem.network_tcnn_insid_split_semcode import NeRFNetwork
             else:
-                if opt.split_sem_code:
-                    from nerf_sem.network_tcnn_insid_split_semcode import NeRFNetwork
-                else:
-                    from nerf_sem.network_tcnn_insid import NeRFNetwork
+                from nerf_sem.network_tcnn_insid import NeRFNetwork
                
         else:
             from nerf.network_tcnn import NeRFNetwork
@@ -176,6 +179,7 @@ if __name__ == '__main__':
     else:
         train_loader = NeRFDataset(opt, device=device, type='train', vae=vae).dataloader()
         extra_configs = [edict({'dim_out':32, 'hidden_dim': 64, 'num_layers':2, 'geo_only': False, 'act_type': None})]
+        extra_configs = []
 
         model = NeRFNetwork(
             encoding="hashgrid",
@@ -186,6 +190,8 @@ if __name__ == '__main__':
             density_thresh=opt.density_thresh,
             bg_radius=opt.bg_radius,
             aabb_bounds=[opt.bx, opt.by, opt.bz, opt.tx, opt.ty, opt.tz],
+            sem_label_emb = max(train_loader._data.target_labels_sem),
+            sem_ins_emb = max(train_loader._data.target_labels_ins),
             extra_configs=extra_configs
         )
         
@@ -214,11 +220,12 @@ if __name__ == '__main__':
             val_data = [
                 train_loader._data.poses_verify, 
                 train_loader._data.images_verify,
-                train_loader._data.sem_datas_verify,
+                train_loader._data.depths_datas_verify,
+                train_loader._data.extra_inputs_verify,
             ]
             global_iter = 0
             while global_iter < opt.iters:
-                outputs = trainer.train(train_loader, step=16, val_data=val_data, sem_map_type=opt.sem_mode)
+                outputs = trainer.train(train_loader, step=16, val_data=val_data)
                 global_iter = trainer.global_step
                 print("Step: ", global_iter)
                 for k,v in outputs.items():

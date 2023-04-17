@@ -109,7 +109,7 @@ class PatchUNet(nn.Module):
 #         return torch.cat([x_rgb, x_alpha], dim=1)
 
 class PatchFeaUNet(nn.Module):
-    def __init__(self, rgb_feat_channels, rgb_channels):
+    def __init__(self, rgb_feat_channels, rgb_channels, act='sigmoid'):
         super(PatchFeaUNet, self).__init__()
         self.inc1 = inconv(rgb_feat_channels, 16)
         self.down1 = down(16, 32)
@@ -117,7 +117,15 @@ class PatchFeaUNet(nn.Module):
         self.up1 = up(96, 32)
         self.up2 = up(48, 16)
         self.outc1 = outconv(16, rgb_channels)
-        self.act = nn.Sigmoid()
+        if act=='sigmoid':
+            self.act = nn.Sigmoid()
+        elif act=='tanh':
+            print("Use tanh activation")
+            self.act = nn.Tanh()
+        elif act=='none':
+            self.act = None
+        else:
+            raise NotImplementedError()
 
     def forward(self, rgb_feat):
         x1 = self.inc1(rgb_feat)
@@ -128,7 +136,8 @@ class PatchFeaUNet(nn.Module):
         x_rgb = self.outc1(x4)
 
         # NOTE: added by zehao
-        x_rgb = self.act(x_rgb)
+        if self.act is not None:
+            x_rgb = self.act(x_rgb)
         return x_rgb
 
 class PatchFeaDirUNet(nn.Module):

@@ -28,6 +28,8 @@ class NeRFNetwork(NeRFRenderer):
                  num_layers_color=3,
                  hidden_dim_color=64,
                  bound=1,
+                 sem_label_emb=None,
+                 sem_ins_emb=None,
                  extra_configs=[],
                  **kwargs
                  ):
@@ -127,6 +129,12 @@ class NeRFNetwork(NeRFRenderer):
                 get_activation_layer(config.act_type),
                 geo_only]
             )
+
+        if sem_label_emb:
+            self.sem_label_emb = nn.Embedding(sem_label_emb+10, 16).cuda()
+
+        if sem_ins_emb:
+            self.sem_ins_emb = nn.Embedding(sem_ins_emb+10, 16).cuda()
        
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
@@ -146,21 +154,20 @@ class NeRFNetwork(NeRFRenderer):
         d = (d + 1) / 2 # tcnn SH encoding requires inputs to be in [0, 1]
         d = self.encoder_dir(d)
 
-        #p = torch.zeros_like(geo_feat[..., :1]) # manual input padding
         h_cat = torch.cat([d, geo_feat], dim=-1)
         h = self.color_net(h_cat)
         color = torch.sigmoid(h)
 
         extra_outs = []
-        for (layer, (activation, geo_only)) in zip(self.extra_nets, self.extra_nets_info):
-            if geo_only:
-                x_tmp = layer(geo_feat)
-            else:
-                x_tmp = layer(h_cat)
+        # for (layer, (activation, geo_only)) in zip(self.extra_nets, self.extra_nets_info):
+        #     if geo_only:
+        #         x_tmp = layer(geo_feat)
+        #     else:
+        #         x_tmp = layer(h_cat)
             
-            if activation is not None:
-                x_tmp = activation(x_tmp)
-            extra_outs.append(x_tmp)
+        #     if activation is not None:
+        #         x_tmp = activation(x_tmp)
+        #     extra_outs.append(x_tmp)
         
         return sigma, color, extra_outs
 

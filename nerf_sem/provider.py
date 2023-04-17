@@ -128,7 +128,8 @@ class NeRFDataset:
 
         self.test_len = len(test_index)
 
-        self.target_labels = set() # only for classification sem model
+        self.target_labels_ins = set() # only for classification sem model
+        self.target_labels_sem = set() # only for classification sem model
 
         # load image size
         if 'h' in transform and 'w' in transform:
@@ -178,46 +179,21 @@ class NeRFDataset:
 
             self.poses = []
             self.images = []
-            self.sem_datas = []
             self.depths = []
-            self.sem_label_map = []
-            self.nearby_views = []
+
+            self.extra_inputs = []
 
             for k, f in enumerate(tqdm.tqdm(frames, desc=f'Loading {type} data')):
-                f_path = os.path.join(self.root_path, f['file_path']) # rgb
-
                 img_idx = f['file_path'].split('/')[-1].split('.')[0]
-                if self.opt.sem_mode == 'label_rgb':
-                    f_path_sem = os.path.join(self.root_path, 'sem', f"{img_idx}-label.png")
-                    sem_data = cv2.imread(f_path_sem, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
-                elif self.opt.sem_mode == 'ins_rgb':
-                    f_path_sem = os.path.join(self.root_path, 'sem', f"{img_idx}-ins.png")
-                    sem_data = cv2.imread(f_path_sem, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
-                elif self.opt.sem_mode == 'label_id':
-                    f_path_sem = os.path.join(self.root_path, 'sem', f"{img_idx}-label.npy")
-                    sem_data = np.load(f_path_sem)
-                    self.target_labels = self.target_labels.union(set(np.unique(sem_data)))
-                    sem_data[sem_data==-100] = 0
-                elif self.opt.sem_mode == 'ins_id':
-                    f_path_sem = os.path.join(self.root_path, 'sem', f"{img_idx}-instance.npy")
-                    sem_data = np.load(f_path_sem)
-                    self.target_labels = self.target_labels.union(set(np.unique(sem_data)))
-                    sem_data[sem_data==-100] = 0
-                else:
-                    raise ValueError("Please check input argument sem_mode")
-
+                # NOTE: Load RGB
                 # there are non-exist paths in fox...
+                f_path = os.path.join(self.root_path, f['file_path']) # rgb
                 if not os.path.exists(f_path):
                     raise FileNotFoundError(f"Please check transforms.json file_path = {f_path}")
                 
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
                 pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
-
                 image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
-                
-                if self.H is None or self.W is None:
-                    self.H = image.shape[0] // downscale
-                    self.W = image.shape[1] // downscale
 
                 # add support for the alpha channel as a mask.
                 if image.shape[-1] == 3: 
@@ -229,146 +205,122 @@ class NeRFDataset:
                     image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
 
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
-
-                # NOTE: Mar 22 2023, keep image 3 channel
                 image = image[:,:,:3]
 
-                if self.opt.depth_sup:
-                    f_path_depth = os.path.join(self.root_path, 'depth', f"{img_idx}.npy")
-                    depth_data = np.load(f_path_depth)
-                    depth_data[depth_data==0] = 20000 # TODO give large value for inf depth 
-                    
-                    if os.environ.get('DEBUG', False):
-                        def depth_observation(depth_obs):
-                            depth_img = Image.fromarray((depth_obs / np.amax(depth_obs) * 255).astype(np.uint8), mode="L")
-                            depth_img.show()
-                        depth_observation(depth_data)
+                if self.H is None or self.W is None:
+                    self.H = image.shape[0] // downscale
+                    self.W = image.shape[1] // downscale
 
-                    if depth_data.shape[0] != self.H or depth_data.shape[1] != self.W:
-                        depth_data = resize_local_mean(depth_data, (self.H, self.W), preserve_range=True)
-                    
-                    depth_data = depth_data / 1000 * self.scale_factor
-                    
-                    f = transform['fl_x']
-                    if self.opt.radial_depth:
-                        # TODO: after verification of else part, remove this radial depth part (i.e. change pred_depth to plane-to-plane depth directly)
-                        for i in range(self.W):
-                            for j in range(self.H):
-                                depth_data[j, i] = np.sqrt(f**2 + (i-transform['cx'])**2 + (j-transform['cy'])**2) * depth_data[j,i]/f
-                    else:
-                        xs, ys = np.meshgrid(np.arange(self.W), np.arange(self.H))
-                        self.depth_radial2plane = f/np.sqrt(f**2 + (xs - transform['cx']) ** 2 + (ys - transform['cy']) ** 2)
+                # NOTE: Load depth
+                f_path_depth = os.path.join(self.root_path, 'depth', f"{img_idx}.npy")
+                depth_data = np.load(f_path_depth)
+                depth_data[depth_data==0] = 20000 # TODO give large value for inf depth 
+                
+                if os.environ.get('DEBUG', False):
+                    def depth_observation(depth_obs):
+                        depth_img = Image.fromarray((depth_obs / np.amax(depth_obs) * 255).astype(np.uint8), mode="L")
+                        depth_img.show()
+                    depth_observation(depth_data)
 
-                if 'rgb' in self.opt.sem_mode:
-                    if len(sem_data.shape) == 2:
-                        # for single value semantic map
-                        raise NotImplementedError()
-                    else:
-                        sem_data = cv2.cvtColor(sem_data, cv2.COLOR_BGR2RGB)
+                if depth_data.shape[0] != self.H or depth_data.shape[1] != self.W:
+                    depth_data = resize_local_mean(depth_data, (self.H, self.W), preserve_range=True)
+                
+                depth_data = depth_data / 1000 * self.scale_factor
+                
+                f = transform['fl_x']
+                if self.opt.radial_depth:
+                    for i in range(self.W):
+                        for j in range(self.H):
+                            depth_data[j, i] = np.sqrt(f**2 + (i-transform['cx'])**2 + (j-transform['cy'])**2) * depth_data[j,i]/f
+                else:
+                    xs, ys = np.meshgrid(np.arange(self.W), np.arange(self.H))
+                    self.depth_radial2plane = f/np.sqrt(f**2 + (xs - transform['cx']) ** 2 + (ys - transform['cy']) ** 2)
 
-                    if sem_data.shape[0] != self.H or sem_data.shape[1] != self.W:
-                        sem_data = cv2.resize(sem_data, (self.W, self.H), interpolation=cv2.INTER_AREA)
-                        
-                    sem_data = sem_data.astype(np.float32) / 255
-                elif 'id' in self.opt.sem_mode:
+                # NOTE: Load Extra
+                extra_in = {}
+                if self.opt.load_sem:
+                    # semantic segmentation
+                    f_path_sem = os.path.join(self.root_path, 'sem', f"{img_idx}-label.npy")
+                    sem_data = np.load(f_path_sem)
+                    self.target_labels_sem = self.target_labels_sem.union(set(np.unique(sem_data)))
+                    sem_data[sem_data==-100] = 0
                     if sem_data.shape[0] != self.H or sem_data.shape[1] != self.W:
                         sem_data = cv2.resize(sem_data, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
+                    extra_in['sem_map'] = sem_data
+                    
+                    # instance segmentation
+                    f_path_sem = os.path.join(self.root_path, 'sem', f"{img_idx}-instance.npy")
+                    sem_data2 = np.load(f_path_sem)
+                    self.target_labels_ins = self.target_labels_ins.union(set(np.unique(sem_data2)))
+                    sem_data2[sem_data2==-100] = 0
+                    if sem_data2.shape[0] != self.H or sem_data2.shape[1] != self.W:
+                        sem_data2 = cv2.resize(sem_data2, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
+                    extra_in['ins_map'] = sem_data2
                 else:
                     pass
+                
+                if self.opt.use_normal:
+                    f_path_norm = os.path.join(self.root_path, 'normal', f"{img_idx}.npy")
+                    normal_data = np.load(f_path_norm, allow_pickle=True)
+                    normal = normal_data.item().get('normal')
+                    msk = ~normal_data.item().get('msk')
+                    if normal.shape[0] != self.H or normal.shape[1] != self.W:
+                        normal = cv2.resize(normal, (self.W, self.H), interpolation=cv2.INTER_AREA)
+                        msk = cv2.resize(msk, (self.W, self.H), interpolation=cv2.INTER_AREA)
+                    extra_in['normal_map'] = normal
+                    extra_in['normal_msk'] = msk
 
                 self.poses.append(pose)
                 self.images.append(image)
-                self.sem_datas.append(sem_data)
-                if self.opt.depth_sup:
-                    self.depths.append(depth_data)
-                
-                if self.opt.reprojection_loss:
-                    nearby_view_info = dict()
-                    self.nearby_views.append(nearby_view_info)
+                self.depths.append(depth_data)
+                self.extra_inputs.append(extra_in)
         
         # Create data splits
         self.poses_train = []
         self.images_train = []
         self.depths_train = []
-        self.sem_datas_train = []
-        self.nearby_views_train = []
+        self.extra_inputs_train = []
 
         self.poses_test = []
         self.images_test = []
         self.depths_test = []
-        self.sem_datas_test = []
-        self.nearby_views_test = []
-        ref_step = 4
-        for k in range(len(self.poses)):
-            if self.opt.reprojection_loss:
-                self.nearby_views[k].update({
-                    "rgb": self.images[k+ref_step] if k+ref_step < len(self.poses) else self.images[k-ref_step],
-                    "sem": self.sem_datas[k+ref_step] if k+ref_step < len(self.poses) else self.sem_datas[k-ref_step],
-                })
-                if self.opt.depth_sup:
-                    self.nearby_views[k].update({
-                        "depth": self.depths[k+ref_step] if k+ref_step < len(self.poses) else self.depths[k-ref_step],
-                    })
-                if self.opt.reprojection_loss:
-                    self.nearby_views[k].update({
-                        "pose": self.poses[k+ref_step] if k+ref_step < len(self.poses) else self.poses[k-ref_step],
-                    })
+        self.extra_inputs_test = []
 
+        for k in range(len(self.poses)):
             if k in test_index:
                 self.poses_test.append(self.poses[k])
                 self.images_test.append(self.images[k])
-                self.sem_datas_test.append(self.sem_datas[k])
-                if self.opt.depth_sup:
-                    self.depths_test.append(self.depths[k])
-                if self.opt.reprojection_loss:
-                    self.nearby_views_test.append(self.nearby_views[k])
+                self.extra_inputs_test.append(self.extra_inputs[k])
+                self.depths_test.append(self.depths[k])
             else:
                 self.poses_train.append(self.poses[k])
                 self.images_train.append(self.images[k])
-                self.sem_datas_train.append(self.sem_datas[k])
-                if self.opt.depth_sup:
-                    self.depths_train.append(self.depths[k])
-                if self.opt.reprojection_loss:
-                    self.nearby_views_train.append(self.nearby_views[k])
+                self.extra_inputs_train.append(self.extra_inputs[k])
+                self.depths_train.append(self.depths[k])
 
         # NOTE: copy a set of frames as verification of training quality
-        # self.poses_verify = [p for i, p in enumerate(self.poses) if i%self.val_sample_step==0 ]
-        # self.images_verify = [im for i, im in enumerate(self.images) if i%self.val_sample_step==0 ]
-        # self.images_sem_verify = [im for i, im in enumerate(self.images_sem) if i%self.val_sample_step==0 ]
         self.poses_verify = [p for i, p in enumerate(self.poses_train) if i in verify_index ]
         self.images_verify = [im for i, im in enumerate(self.images_train) if i in verify_index ]
-        self.sem_datas_verify = [im for i, im in enumerate(self.sem_datas_train) if i in verify_index ]
-        if self.opt.depth_sup:
-            self.depths_datas_verify = [im for i, im in enumerate(self.depths_train) if i in verify_index ]
-        if self.opt.reprojection_loss:
-            self.nearby_views_verify = [im for i, im in enumerate(self.nearby_views_train) if i in verify_index ]
-
-        # TODO: append several not trained data
+        self.depths_datas_verify = [im for i, im in enumerate(self.depths_train) if i in verify_index ]
+        self.extra_inputs_verify = [im for i, im in enumerate(self.extra_inputs_train) if i in verify_index ]
         self.poses_verify += self.poses_test
         self.images_verify += self.images_test
-        self.sem_datas_verify += self.sem_datas_test
-        if self.opt.depth_sup:
-            self.depths_datas_verify += self.depths_test
-        if self.opt.reprojection_loss:
-            self.nearby_views_verify += self.nearby_views_test
+        self.depths_datas_verify += self.depths_test
+        self.extra_inputs_verify += self.extra_inputs_test
 
         self.poses_train = torch.from_numpy(np.stack(self.poses_train, axis=0)) # [N, 4, 4]
-        if self.images_train is not None:
-            self.images_train = torch.from_numpy(np.stack(self.images_train, axis=0)) # [N, H, W, C]
-        if self.sem_datas_train is not None:
-            self.sem_datas_train = torch.from_numpy(np.stack(self.sem_datas_train, axis=0))
-        if self.opt.depth_sup:
-            self.depths_train = torch.from_numpy(np.stack(self.depths_train, axis=0))
-            self.depth_radial2plane = torch.from_numpy(self.depth_radial2plane)
-        # calculate mean radius of all camera poses
-        self.radius = self.poses_train[:, :3, 3].norm(dim=-1).mean(0).item()
-        #print(f'[INFO] dataset camera poses: radius = {self.radius:.4f}, bound = {self.bound}')
+        self.images_train = torch.from_numpy(np.stack(self.images_train, axis=0)) # [N, H, W, C]
+        self.depths_train = torch.from_numpy(np.stack(self.depths_train, axis=0))
+        self.depth_radial2plane = torch.from_numpy(self.depth_radial2plane)
 
-        # initialize error_map
-        if self.training and self.opt.error_map:
-            self.error_map = torch.ones([self.images_train.shape[0], 128 * 128], dtype=torch.float) # [B, 128 * 128], flattened for easy indexing, fixed resolution...
-        else:
-            self.error_map = None
+        # NOTE:
+        self.extra_in_train = {}
+        for k in self.extra_inputs_train[0].keys():
+            self.extra_in_train[k] = torch.from_numpy(np.stack([info[k] for info in self.extra_inputs_train], axis=0))
+        
+        self.radius = self.poses_train[:, :3, 3].norm(dim=-1).mean(0).item()
+
+        self.error_map = None
 
         # [debug] uncomment to view all training poses.
         # visualize_poses(self.poses.numpy())
@@ -384,14 +336,11 @@ class NeRFDataset:
                 else:
                     dtype = torch.float
                 self.images_train = self.images_train.to(dtype).to(self.device)
- 
-                self.sem_datas_train = self.sem_datas_train.to(dtype).to(self.device)
-                if self.opt.depth_sup:
-                    self.depths_train = self.depths_train.to(dtype).to(self.device)
-                    self.depth_radial2plane = self.depth_radial2plane.to(dtype).to(self.device)
+                self.depths_train = self.depths_train.to(dtype).to(self.device)
+                self.depth_radial2plane = self.depth_radial2plane.to(dtype).to(self.device)
 
-            if self.error_map is not None:
-                self.error_map = self.error_map.to(self.device)
+                for k in self.extra_in_train.keys():
+                    self.extra_in_train[k] = self.extra_in_train[k].to(self.device)
 
         # load intrinsics
         if 'fl_x' in transform or 'fl_y' in transform:
@@ -439,9 +388,7 @@ class NeRFDataset:
             }
 
         poses = self.poses_train[index].to(self.device) # [B, 4, 4]
-
         error_map = None if self.error_map is None else self.error_map[index]
- 
         rays = get_rays(poses, self.intrinsics, self.H_ray, self.W_ray, self.num_rays, error_map, self.opt.patch_size)
 
         results = {
@@ -452,50 +399,42 @@ class NeRFDataset:
             'pixel_space_inds': rays['pixel_space_inds']
         }
 
-        if self.images_train is not None:
-            images = self.images_train[index].to(self.device) # [B, H, W, 3/4]
-            if self.opt.low_res_img:
-                images = images[:, ::8, ::8, :].contiguous()
+        images = self.images_train[index].to(self.device) # [B, H, W, 3/4]
+        if self.opt.low_res_img:
+            images = images[:, ::8, ::8, :].contiguous()
 
-            if self.training:
-                C = images.shape[-1]
-                images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
-            results['images'] = images
-
-        if self.sem_datas_train is not None:
-            sem_datas = self.sem_datas_train[index].to(self.device) # [B, H, W, none/3/4]
-
-            if self.training:
-                C = sem_datas.shape[-1]
-                if len(sem_datas.shape) == 3:
-                    sem_datas = torch.gather(sem_datas.view(B, -1), 1, rays['inds']) # [B, N]
-                else:
-                    sem_datas = torch.gather(sem_datas.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
-            results['images_sem'] = sem_datas 
+        if self.training:
+            C = images.shape[-1]
+            images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
+        results['images'] = images
         
-        if self.opt.depth_sup:
-            depths = self.depths_train[index].to(self.device) # [B, H, W, none/3/4]
-            depth_radial2plane = self.depth_radial2plane
+        depths = self.depths_train[index].to(self.device) # [B, H, W, none/3/4]
+        depth_radial2plane = self.depth_radial2plane
 
-            if self.training:
-                C = depths.shape[-1]
-                depths = torch.gather(depths.view(B, -1), 1, rays['inds'])
-                depth_radial2plane = torch.gather(depth_radial2plane.view(B, -1), 1, rays['inds'])
-            results['images_depth'] = depths 
-            results['depth_radial2plane'] = depth_radial2plane 
+        if self.training:
+            C = depths.shape[-1]
+            depths = torch.gather(depths.view(B, -1), 1, rays['inds'])
+            depth_radial2plane = torch.gather(depth_radial2plane.view(B, -1), 1, rays['inds'])
+        results['images_depth'] = depths 
+        results['depth_radial2plane'] = depth_radial2plane 
 
         # need inds to update error_map
         if error_map is not None:
             results['index'] = index
             results['inds_coarse'] = rays['inds_coarse']
         
-        # NOTE: pad random patch only for depth regularization
-        if self.opt.depth_reg:
-            sample_size = 4
-            rd_poses = rand_poses(sample_size, self.device, radius=self.radius)
-            rd_rays = get_rays(rd_poses, self.intrinsics, self.H_ray, self.W_ray, self.num_rays//2, error_map=None, patch_size=self.opt.patch_size)
-            results.update({'rd_rays_o': rd_rays['rays_o'], 'rd_rays_d': rd_rays['rays_d']})
-            
+        if self.extra_in_train is not None:
+            for k in self.extra_in_train:
+                datum = self.extra_in_train[k][index].to(self.device) # [B, H, W, none/3/4]
+
+                if self.training:
+                    C = datum.shape[-1]
+                    if len(datum.shape) == 3:
+                        datum = torch.gather(datum.view(B, -1), 1, rays['inds']) # [B, N]
+                    else:
+                        datum = torch.gather(datum.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
+                results[k] = datum 
+        
         return results
 
     def dataloader(self):

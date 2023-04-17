@@ -6,7 +6,6 @@ import raymarching
 from .utils import custom_meshgrid
 import numpy as np
 
-
 def dist_loss(w, t):
     # transfered from jax code of mip nerf 360
     ut = (t[..., 1:] + t[..., :-1]) / 2
@@ -51,7 +50,6 @@ class NeRFRenderer(nn.Module):
         if cuda_ray:
             # density grid
             density_grid = torch.zeros([self.cascade, self.grid_size ** 3]) # [CAS, H * H * H]
-            density_grid2 = torch.zeros([self.cascade, self.grid_size ** 3]) # [CAS, H * H * H]
             density_bitfield = torch.zeros(self.cascade * self.grid_size ** 3 // 8, dtype=torch.uint8) # [CAS * H * H * H // 8]
             self.register_buffer('density_grid', density_grid)
             self.register_buffer('density_bitfield', density_bitfield)
@@ -368,11 +366,7 @@ class NeRFRenderer(nn.Module):
         for idx, config in enumerate(extra_configs):
             extra_out_infos.append((idx, config.dim_out))
 
-        # rays_o, rays_d: [B, N, 3], assumes B == 1
-        # return: pred_rgb: [B, N, 3]
-
         _run = self.run_cuda
-        # never stage when cuda_ray
         results = _run(rays_o, rays_d, extra_out_infos=extra_out_infos, **kwargs)
 
         return results

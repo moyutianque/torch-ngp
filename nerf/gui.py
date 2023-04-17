@@ -78,7 +78,8 @@ class NeRFGUI:
         self.val_data = [
             train_loader._data.poses_verify, 
             train_loader._data.images_verify,
-            train_loader._data.sem_datas_verify,
+            train_loader._data.depths_datas_verify,
+            train_loader._data.extra_inputs_verify,
         ]
 
         if self.opt.depth_sup:
@@ -94,11 +95,6 @@ class NeRFGUI:
         self.need_update = True # camera moved, should reset accumulation
         self.spp = 1 # sample per pixel
         self.mode = 'image' # choose from ['image', 'depth']
-
-        if 'rgb' in self.opt.sem_mode:
-            self.sem_map_type = 'rgb'
-        else:
-            self.sem_map_type = 'id'
 
         self.dynamic_resolution = False
         self.downscale = 1
@@ -152,12 +148,9 @@ class NeRFGUI:
         # if self.mode == 'image':
         #     return outputs['image']
         # elif self.mode == 'sem':
-        #     if "rgb" in self.opt.sem_mode:
-        #         return outputs['sem']
-        #     else:
-        #         outputs['sem'] = np.argmax(outputs['sem'], axis=-1).astype(int)
-        #         out_sem = d3_40_colors_rgb[outputs['sem'] % 40].astype(np.float32)/255.
-        #         return out_sem
+    #         outputs['sem'] = np.argmax(outputs['sem'], axis=-1).astype(int)
+    #         out_sem = d3_40_colors_rgb[outputs['sem'] % 40].astype(np.float32)/255.
+    #         return out_sem
         # else:
         #     return np.expand_dims(outputs['depth'], -1).repeat(3, -1)
 
