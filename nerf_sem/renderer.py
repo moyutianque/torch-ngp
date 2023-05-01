@@ -163,12 +163,14 @@ class NeRFRenderer(nn.Module):
             sigmas = self.density_scale * sigmas
 
             # ray intergral
-            weights_sum, depth, image = raymarching.composite_rays_train_sem(sigmas, rgbs, deltas, rays, T_thresh)
+            # TODO: composite_rays_train_sem has broken gradient from depth
+            weights_sum, depth, image = raymarching.composite_rays_train(sigmas, rgbs, deltas, rays, T_thresh)
             image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
 
             # ray integral of extra_out
             extra_projections = []
             for (extra_out, extra_out_info) in zip(extra_outs, extra_out_infos):
+                # TODO: composite_rays_train_sem has broken gradient from depth
                 weights_sum_feat, _, feat = raymarching.composite_rays_train_sem(sigmas, extra_out, deltas, rays, T_thresh)
                 feat = feat + (1 - weights_sum_feat).unsqueeze(-1) * 1
                 

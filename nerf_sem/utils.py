@@ -548,12 +548,16 @@ class Trainer(object):
         loss_depth = torch.tensor(0.).cuda()
         if self.opt.use_depth:
             pred_depth = outputs['depth'] * data['depth_radial2plane']
-            pred_depth = pred_depth.view(-1, self.opt.patch_size, self.opt.patch_size, 1).permute(0, 3, 1, 2).contiguous()
-            gt_depth = data['images_depth'].view(-1, self.opt.patch_size, self.opt.patch_size, 1).permute(0, 3, 1, 2).contiguous()
-            
+            if self.opt.patch_size > 1: 
+                pred_depth = pred_depth.view(-1, self.opt.patch_size, self.opt.patch_size, 1).permute(0, 3, 1, 2).contiguous()
+                gt_depth = data['images_depth'].view(-1, self.opt.patch_size, self.opt.patch_size, 1).permute(0, 3, 1, 2).contiguous()
+            else:
+                gt_depth = data['images_depth']
+
             loss_depth = torch.abs(torch.log(gt_depth)-torch.log(pred_depth))
             filtered_idx = (~torch.isinf(loss_depth)) & (~torch.isnan(loss_depth))
             loss_depth = loss_depth[filtered_idx].mean()
+            print(loss_depth)
 
             # NOTE: simple version
             # loss_depth = self.criterion(pred_depth, gt_depth).mean()
@@ -580,9 +584,9 @@ class Trainer(object):
                 gt_sem_ins = gt_sem_ins.view(-1, self.opt.patch_size, self.opt.patch_size).contiguous()
                 
                 # NOTE: filter out patch who only has one label
-                for i, sem_ins in enumerate(gt_sem_ins):
-                    if len(torch.unique(sem_ins)) <= 1:
-                        indices.remove(i)
+                # for i, sem_ins in enumerate(gt_sem_ins):
+                #     if len(torch.unique(sem_ins)) <= 1:
+                #         indices.remove(i)
 
                 gt_sem_ins = self.model.sem_ins_emb(gt_sem_ins).permute(0,3,1,2)
                 pred_depth = torch.cat([pred_depth, gt_sem_ins], dim=1)
@@ -601,8 +605,12 @@ class Trainer(object):
                     for i in range(pred_norm.shape[0]):
                         if torch.any(gt_normal_msk[i]):
                             cnt += 1
-                            loss_normal += self.criterion(pred_norm[i][:,1:-1,1:-1][gt_normal_msk[i][:,1:-1,1:-1]], gt_normal[i][:,1:-1,1:-1][gt_normal_msk[i][:,1:-1,1:-1]].to(gt_rgb.dtype)).mean()
-                    loss_normal = loss_normal/cnt
+                            loss_normal_item = self.criterion(pred_norm[i][:,1:-1,1:-1][gt_normal_msk[i][:,1:-1,1:-1]], gt_normal[i][:,1:-1,1:-1][gt_normal_msk[i][:,1:-1,1:-1]].to(gt_rgb.dtype))
+                            filtered_idx = (~torch.isinf(loss_normal_item)) & (~torch.isnan(loss_normal_item))
+                            if len(loss_normal_item[filtered_idx])>0:
+                                loss_normal += loss_normal_item[filtered_idx].mean()
+                    if cnt > 0:
+                        loss_normal = loss_normal/cnt
 
         # TODO: make multiple extra outs possible
         extra_losses = []
@@ -826,7 +834,7 @@ class Trainer(object):
 
             if self.global_step > self.opt.warmup_iter:
                 if self.opt.use_normal:
-                    tot_loss += loss_dict['loss_normal']
+                    tot_loss += loss_dict['loss_normal'] * 0.01
                 if self.opt.use_depth:
                     tot_loss += loss_dict['loss_depth']
 

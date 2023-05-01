@@ -171,12 +171,6 @@ class NeRFDataset:
                 pose[:3, 3] = (1 - ratio) * pose0[:3, 3] + ratio * pose1[:3, 3]
                 self.poses.append(pose)
         else:
-            # for colmap, manually split a valid set (the first frame).
-            if type == 'train':
-                frames = frames[1:]
-            elif type == 'val':
-                frames = frames[:1]
-
             self.poses = []
             self.images = []
             self.depths = []
